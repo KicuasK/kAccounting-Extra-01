@@ -1,0 +1,79 @@
+{
+  "purpose": "Isolated test book only. Run in order; capture response IDs.",
+  "requests": [
+    {
+      "action": "create",
+      "input": {
+        "name": "TPASS_Examples",
+        "parent": "${ISOLATED_HOME}",
+        "start_date": "2024-01-01"
+      }
+    },
+    {
+      "action": "account_save",
+      "capture": "CASH_ID",
+      "input": {
+        "name": "Cash",
+        "type": "A"
+      }
+    },
+    {
+      "action": "account_save",
+      "capture": "CAPITAL_ID",
+      "input": {
+        "name": "Capital",
+        "type": "F"
+      }
+    },
+    {
+      "action": "account_save",
+      "capture": "PREPAID_ID",
+      "input": {
+        "name": "Prepaid Expense - TPASS",
+        "type": "A",
+        "function": "Prepaid Expense"
+      }
+    },
+    {
+      "action": "account_save",
+      "capture": "EASYCARD_ID",
+      "input": {
+        "name": "EasyCard - Example",
+        "type": "A"
+      }
+    },
+    {
+      "action": "account_save",
+      "capture": "TRA_EXPENSE_ID",
+      "input": {
+        "name": "Transportation - TR",
+        "type": "E"
+      }
+    },
+    {
+      "action": "journal_save",
+      "input": {
+        "date": "2024-01-01",
+        "kind": "Opening",
+        "lines": [
+          {
+            "account_id": "${CASH_ID}",
+            "debit": 10000
+          },
+          {
+            "account_id": "${EASYCARD_ID}",
+            "debit": 1000
+          },
+          {
+            "account_id": "${CAPITAL_ID}",
+            "credit": 11000
+          }
+        ]
+      }
+    },
+    {
+      "action": "activate",
+      "input": {}
+    }
+  ]
+}

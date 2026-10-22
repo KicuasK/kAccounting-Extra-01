@@ -1,0 +1,14 @@
+{
+  "verified_date": "2026-10-22",
+  "schema_version": 34,
+  "isolated_book": true,
+  "result": "passed",
+  "checks": [
+    "purchase creates balanced journal and 30-day period",
+    "TPASS ride creates no additional financial journal",
+    "amortization amounts 80 and 1120",
+    "amortization journal time 23:59:59",
+    "EasyCard actual charge 64",
+    "deleting ride preserves financial journal lines"
+  ]
+}

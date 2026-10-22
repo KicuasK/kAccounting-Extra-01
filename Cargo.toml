@@ -1,0 +1,7 @@
+[workspace]
+members = ["backend"]
+resolver = "3"
+
+[profile.release]
+overflow-checks = true
+

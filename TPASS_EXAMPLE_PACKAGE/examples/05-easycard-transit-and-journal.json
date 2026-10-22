@@ -1,0 +1,49 @@
+{
+  "purpose": "A separate real-wallet-charge transaction, not a TPASS ride.",
+  "requests": [
+    {
+      "action": "document_save",
+      "capture": "EASYCARD_RIDE_ID",
+      "input": {
+        "type": "Transit Ride",
+        "date": "2024-10-08",
+        "mrt_operator": "TRA",
+        "mrt_from_station": "1120",
+        "mrt_to_station": "1210",
+        "mrt_ride_time": "12:54:01",
+        "mrt_train_type": "區間",
+        "mrt_pass_plan": "EasyCard",
+        "mrt_wallet_charge": 64
+      }
+    },
+    {
+      "action": "journal_save",
+      "capture": "EASYCARD_JOURNAL_ID",
+      "input": {
+        "date": "2024-10-08",
+        "time": "12:54:01",
+        "kind": "Normal",
+        "documents": [
+          "${EASYCARD_RIDE_ID}"
+        ],
+        "lines": [
+          {
+            "account_id": "${TRA_EXPENSE_ID}",
+            "debit": 64
+          },
+          {
+            "account_id": "${EASYCARD_ID}",
+            "credit": 64
+          }
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "title": "國營臺灣鐵路股份有限公司 · 楊梅 → 新竹",
+    "badge": "EasyCard",
+    "easycard_balance_delta": -64,
+    "prepaid_balance_delta": 0,
+    "tpass_ride_count_delta": 0
+  }
+}

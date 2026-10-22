@@ -1,0 +1,23 @@
+{
+  "action": "tpass_buy",
+  "input": {
+    "name": "Example 30-day TPASS",
+    "purchase_date": "2024-09-29",
+    "start_date": "2024-09-29",
+    "cost": 1200,
+    "prepaid_account_id": "${PREPAID_ID}",
+    "payment_account_id": "${CASH_ID}",
+    "description": "TPASS Pass Purchase"
+  },
+  "capture": {
+    "PERIOD_ID": "data.period_id",
+    "PURCHASE_JOURNAL_ID": "data.journal_id"
+  },
+  "expected": {
+    "start_date": "2024-09-29",
+    "end_date": "2024-10-28",
+    "purchase_debit": 1200,
+    "purchase_credit": 1200,
+    "creates_purchase_and_period_atomically": true
+  }
+}

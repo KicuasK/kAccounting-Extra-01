@@ -1,0 +1,49 @@
+{
+  "warning": "Expected system-generated results only. Never submit these via journal_save; doing so would duplicate automatic expenses and omit tpass_amortization bookkeeping.",
+  "trigger": {
+    "action": "tpass_report",
+    "input": {
+      "period_id": "${PERIOD_ID}"
+    }
+  },
+  "expected_after_through_2024_10_28": [
+    {
+      "date": "2024-09-30",
+      "time": "23:59:59",
+      "kind": "Normal",
+      "description": "TPASS Amortization · 2024-09",
+      "lines": [
+        {
+          "account": "E - Transportation - TPASS",
+          "debit": 80,
+          "credit": 0
+        },
+        {
+          "account_id": "${PREPAID_ID}",
+          "debit": 0,
+          "credit": 80
+        }
+      ]
+    },
+    {
+      "date": "2024-10-28",
+      "time": "23:59:59",
+      "kind": "Normal",
+      "description": "TPASS Amortization · 2024-10",
+      "lines": [
+        {
+          "account": "E - Transportation - TPASS",
+          "debit": 1120,
+          "credit": 0
+        },
+        {
+          "account_id": "${PREPAID_ID}",
+          "debit": 0,
+          "credit": 1120
+        }
+      ]
+    }
+  ],
+  "expected_total": 1200,
+  "expected_prepaid_balance_after_full_amortization": 0
+}

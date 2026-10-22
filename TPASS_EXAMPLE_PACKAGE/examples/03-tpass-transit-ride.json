@@ -1,0 +1,27 @@
+{
+  "action": "document_save",
+  "input": {
+    "type": "Transit Ride",
+    "date": "2024-10-07",
+    "tpass_period_id": "${PERIOD_ID}",
+    "mrt_operator": "AirportMRT",
+    "mrt_from_station": "A22",
+    "mrt_to_station": "A18",
+    "mrt_ride_time": "09:16:00",
+    "mrt_train_type": "Commuter",
+    "mrt_pass_plan": "基北北桃 1200",
+    "mrt_wallet_charge": 0,
+    "mrt_reference_fare": 35
+  },
+  "capture": {
+    "TPASS_RIDE_ID": "data.id"
+  },
+  "expected": {
+    "route": "老街溪 → 高鐵桃園站",
+    "reference_total_increment": 35,
+    "ride_count_increment": 1,
+    "journal_count_delta": 0,
+    "prepaid_balance_delta": 0,
+    "linked_journal": "${PURCHASE_JOURNAL_ID}"
+  }
+}

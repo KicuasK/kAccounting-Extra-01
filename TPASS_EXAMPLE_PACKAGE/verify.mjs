@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+const directory=path.dirname(fileURLToPath(import.meta.url));
+const repo=process.env.KACCOUNTING_REPO || path.resolve(directory,'../..');
+const {withIsolatedApp}=await import(pathToFileURL(path.join(repo,'scripts/lib/isolated-app.mjs')).href);
+const read=async name=>JSON.parse(await fs.readFile(path.join(directory,'examples',name),'utf8'));
+await withIsolatedApp(async({home,api,errors})=>{
+ const variables={ISOLATED_HOME:home};
+ const resolve=value=>typeof value==='string' ? value.replace(/\$\{([^}]+)\}/g,(_,key)=>{assert(key in variables,`Missing variable ${key}`);return variables[key]}) : Array.isArray(value) ? value.map(resolve) : value && typeof value==='object' ? Object.fromEntries(Object.entries(value).map(([key,val])=>[key,resolve(val)])) : value;
+ async function request(descriptor){
+  const result=await api(descriptor.action,resolve(descriptor.input));
+  if(typeof descriptor.capture==='string') variables[descriptor.capture]=result.id;
+  else for(const [key,selector] of Object.entries(descriptor.capture || {})) variables[key]=selector.split('.').slice(1).reduce((obj,field)=>obj[field],result);
+  return result;
+ }
+ for(const req of (await read('01-account-setup.json')).requests) await request(req);
+ await request(await read('02-buy-pass.json'));
+ const report=await api('tpass_report',{period_id:variables.PERIOD_ID});
+ assert.equal(report.period.end_date,'2024-10-28');
+ assert.deepEqual(report.period.amortizations.map(a=>a.amount),[80,1120]);
+ const beforeRide=(await api('state')).book;
+ await request(await read('03-tpass-transit-ride.json'));
+ let book=(await api('state')).book;
+ assert.equal(book.journal.length,beforeRide.journal.length);
+ assert.deepEqual(book.accounts.map(a=>[a.id,a.balance]),beforeRide.accounts.map(a=>[a.id,a.balance]));
+ const journalIDs=report.period.amortizations.map(a=>a.journal_id);
+ assert(book.journal.filter(j=>journalIDs.includes(j.id)).every(j=>j.time==='23:59:59'));
+ const rideReport=await api('tpass_report',{period_id:variables.PERIOD_ID});
+ assert.equal(rideReport.ride_count,1);assert.equal(rideReport.reference_total,35);
+ assert(book.journal.find(j=>j.id===variables.PURCHASE_JOURNAL_ID).documents.includes(variables.TPASS_RIDE_ID));
+ for(const req of (await read('05-easycard-transit-and-journal.json')).requests) await request(req);
+ book=(await api('state')).book;
+ assert.equal(book.accounts.find(a=>a.id===variables.EASYCARD_ID).balance,936);
+ assert.equal(book.accounts.find(a=>a.id===variables.PREPAID_ID).balance,0);
+ const effects=b=>b.journal.map(j=>({id:j.id,date:j.date,time:j.time,lines:j.lines}));
+ const beforeDelete=effects(book);
+ await request(await read('06-delete-tpass-ride.json'));
+ book=(await api('state')).book;
+ assert.deepEqual(effects(book),beforeDelete);
+ assert(!book.documents.some(d=>d.id===variables.TPASS_RIDE_ID));
+ assert.equal((await api('tpass_report',{period_id:variables.PERIOD_ID})).ride_count,0);
+ assert.deepEqual(errors,[]);
+ console.log(JSON.stringify({passed:true,isolated:true,purchase:true,rideWithoutExpense:true,amortizationTime:'23:59:59',easyCardCharge:64,deletePreservesJournals:true}));
+});

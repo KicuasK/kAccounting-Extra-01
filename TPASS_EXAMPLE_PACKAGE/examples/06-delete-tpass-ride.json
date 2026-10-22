@@ -1,0 +1,19 @@
+{
+  "action": "document_action",
+  "input": {
+    "id": "${TPASS_RIDE_ID}",
+    "action": "delete_tpass_ride"
+  },
+  "expected": {
+    "purchase_journal_unchanged": true,
+    "amortization_journals_unchanged": true,
+    "prepaid_balance_delta": 0,
+    "ride_count_delta": -1,
+    "reference_total_delta": -35
+  },
+  "rejection_cases": [
+    "Document linked to a PPE asset",
+    "Document linked to any journal not used as a TPASS period funding journal",
+    "Not a supported TPASS ride or read-only book"
+  ]
+}
