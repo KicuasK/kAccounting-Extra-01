@@ -84,7 +84,11 @@ Decision: approved as recommended on 2026-10-22. The user separately answered
 Recommended:
 
 - Use creation order for siblings in Version 01.
-- Do not add user-visible account codes in Version 01.
+- Original decision: do not add user-visible account codes in Version 01.
+  **Superseded by the later UI request on 2026-10-22:** fixed four-digit account
+  codes combined with the name in one column. See UI_DESIGN_HANDOFF_2026-10-22.md.
+  Code allocation, uniqueness, existing-account migration and exhaustion behavior
+  are not yet designed; the internal AccountId is not this display code.
 - Require sibling names to be unique after the existing edge-whitespace
   normalization, while preserving letter case and Unicode characters.
 - Do not allow a category to be deactivated while it has active descendants.
@@ -224,3 +228,15 @@ acceptance disabled. This was not permission for a permanent root service or a
 replacement GUI installation. After successful disposable HTTPS acceptance, the
 user stopped both foreground test windows; independent cleanup checks passed.
 No real financial books or existing financial keys were authorized for testing.
+
+## Later UI conversation revisions — 2026-10-22
+
+The user selected 02 clear-modern composition, allowed macOS versions beyond
+Catalina, and subsequently requested black/white/gray except category colors,
+four-digit codes combined with names, five labels 資產／負債／權益／收益／費損,
+a restored account-balance column, and inactive-account access in the upper-right
+toolbar. These later instructions supersede earlier conflicting visual/no-code
+policy only; all other accounting, draft and sibling-order decisions remain.
+See [the authoritative UI handoff](UI_DESIGN_HANDOFF_2026-10-22.md) for original
+mockups, latest-request precedence and pending policies. Signed-balance semantics
+and credit-card capacity presentation are not approved by this visual revision.

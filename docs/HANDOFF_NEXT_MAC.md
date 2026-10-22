@@ -12,6 +12,16 @@
 節點登入狀態。GitHub 不代表既有財務資料已移轉。實際推送結果以 Git 遠端
 確認為準；本文件不將未完成的正式安裝、私人代理或 UI 宣稱為完成。
 
+## UI 設計與最新交付補充
+
+後端交付基準 `59d57f1f24f8df262d1cd9761be37a99f5bd22f2` 已實際推送並核對。
+本次再補交 UI 設計與信用卡評估文件；取得 GitHub 最新 main 後讀取
+[UI 設計交接](UI_DESIGN_HANDOFF_2026-10-22.md) 與
+[新電腦開始](START_ON_NEW_MAC.md)。13 張原始示意圖已放入儲存庫。
+最新視覺方向為 02 清晰現代結構、黑白灰且僅類別用色；不再限定 Catalina。
+固定四碼代碼要求取代先前「不顯示科目代碼」決策，但分配／移轉契約尚未實作。
+信用卡與正負號政策仍待確認，不得直接搬用舊專案規則。
+
 ## 接手先讀
 
 1. `AGENTS.md`
@@ -20,6 +30,7 @@
 4. `docs/DEVELOPMENT_PLAN.md`、`docs/API.md`、`docs/OPEN_QUESTIONS.md`
 5. `docs/PRIVATE_INTEGRATION_2026-10-22.md`（最新實際驗收）
 6. `docs/NON_UI_REMAINING_2026-10-22.md`、`docs/PRIVATE_ACCESS.md`
+7. `docs/UI_DESIGN_HANDOFF_2026-10-22.md`、`docs/CREDIT_CARD_CORE_REVIEW_2026-10-22.md`
 
 `docs/HANDOFF_NEW_MAC.md` 保留原始建置說明與歷史輪次；其中較舊的測試數、
 未完成功能描述及 OS 版本不能覆蓋本文件與最新驗收。不能把所有歷史紀錄相加
@@ -86,7 +97,7 @@ Version 01 尚未完成。前端仍是 Catalina 風格唯讀科目樹；完整�
 - 完全驗證成功後只清除內部加密匯入暫存；失敗／中斷或身分不明的暫存保留。
 - 實體 APFS／exFAT 外接磁碟驗收已移至 Version 02，既有程式與測試不刪除。
 - 不設計應用程式密碼，不啟用公開服務／Funnel，不接觸真實帳簿或既有財務金鑰。
-- 不猜測未決科目分類。UI 依核准互動規格與 Catalina Aqua 方向，見
+- 不猜測未決科目分類。UI 依核准互動規格與最新黑白灰的 macOS 設計方向，見
   `docs/UI_STYLE_GUIDE.md` 及核准決策；不要重問已核准政策。
 
 ## 新 Mac 環境與建置
@@ -126,5 +137,6 @@ GitHub 只交付原始碼、測試、文件、migrations 和 lockfile。不能�
 本機專用 Keychain 測試項目依使用者要求保留供檢查，不複製或刪除。
 新 Mac clone／編譯成功不代表既有帳簿或 Keychain 已移轉；不得用真實帳簿測試。
 
-待使用者日後明確要求上傳時，先稽核提交清單與敏感資料，再 commit／push，
-記錄實際交付分支與 commit，並確認遠端確實包含文件與程式。現在尚未執行這一步。
+使用者已明確授權上傳，前一後端交付已推送成功。本次 UI 文件與原圖亦依指示
+提交推送；實際版本以遠端 main 與本次提交記錄為準。不要把舊輪次「尚未提交」
+的歷史記錄當成目前狀態。

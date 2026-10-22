@@ -4,16 +4,19 @@ Private, single-user double-entry accounting software for a Mac Studio, with a R
 
 ## Current status
 
-**New Mac / developer handoff:** start with
-[換電腦建置與開發交接](docs/HANDOFF_NEW_MAC.md) for clone/setup commands,
-verified tool versions, current limitations, and the next implementation steps.
+**Changing development computers:** start with
+[新電腦開始](docs/START_ON_NEW_MAC.md), then
+[完整換機交接](docs/HANDOFF_NEXT_MAC.md) and
+[另一個對話的 UI 設計、13 張原圖與待決事項](docs/UI_DESIGN_HANDOFF_2026-10-22.md).
+All design images are included in this repository; no local chat access is needed.
 
-Latest non-UI increment: [30-minute pre-UI integration](docs/BUILD_30MIN_2026-10-22.md)
-adds undeployed root-peer Unix ingress, disabled installation-readiness plans,
-safe Keychain diagnostics and native-selection epoch protection. Actual non-root
-Unix forgery refusal passed; real private Tailscale/TLS positive, enabled login
-and complete native GUI acceptance remain open. Final integrated verification
-for that increment is recorded in its report.
+Latest verification: **651 backend tests passed (9 intentionally ignored),
+112 tool tests, 41 frontend tests, and Release build passed**. See
+[latest build](docs/BUILD_20MIN_2026-10-22.md). Temporary authenticated private HTTPS
+and four native-panel cases passed; permanent compatible private-proxy installation,
+signed production/Keychain/login qualification and complete Safari UI remain open.
+The current application still has a read-only account tree. The newer selected UI
+is a design only: macOS-inspired 02 layout, black/white/gray except category colors.
 
 The project has a tested Rust/TypeScript accounting foundation with exact TWD
 integers, balanced atomic posting, versioned explicit drafts, immutable

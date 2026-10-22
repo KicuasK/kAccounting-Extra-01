@@ -1,12 +1,13 @@
 # UI Style Guide
 
-Status: draft
+Status: implementation guide with later user-approved visual revisions; see
+[latest UI design handoff](UI_DESIGN_HANDOFF_2026-10-22.md).
 
 ## Visual direction
 
-- Reference macOS Catalina 10.15 light Aqua, not Mojave.
+- Latest user direction: macOS-inspired 02 clear-modern composition, selected in the separate UI conversation; Catalina is no longer the exclusive visual reference.
 - Favor native-looking toolbars, sidebars, compact tables, subtle borders, and restrained decoration.
-- Use a gray toolbar, white primary content, fine separators, and blue selection states.
+- Use black/white/neutral-gray chrome, white content, fine separators and neutral selection. Only accounting-element identification uses color, with text labels. Later requests supersede the older blue-selection direction.
 - Avoid oversized cards, excessive whitespace, and dashboard decoration that reduces accounting density.
 
 ## Typography

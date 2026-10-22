@@ -22,14 +22,14 @@
 
 ## Product and UI constraints
 
-- Use a macOS Catalina 10.15 light Aqua visual direction: compact toolbars and tables, subtle separators, white content, and blue selection states.
+- Follow the latest user UI direction in `docs/UI_DESIGN_HANDOFF_2026-10-22.md`: macOS-inspired 02 clear-modern structure, compact full-width tables and bottom summary; black/white/gray except accounting-category colors. This supersedes the earlier Catalina-only/blue-selection direction.
 - Avoid large modern SaaS-style cards as the primary information layout.
 - Use `system-ui` for all UI text except Chinese characters inside account names, which use `DFKai-SB` with a safe fallback.
 - Keep English, digits, dates, and amounts in account names in the system font.
 - Right-align amounts and use tabular numerals.
 - Support Mac Safari in Version 01. Preserve responsive foundations for the
   touch-friendly iPad Safari Version 02; iPhone support is out of scope.
-- Use the traditional General Journal reference recorded in `docs/UI_STYLE_GUIDE.md` for entry structure.
+- Use the traditional General Journal reference recorded in `docs/UI_STYLE_GUIDE.md` for entry structure. Its Version 01 editing interaction is already approved in `docs/VERSION01_DECISIONS.md`; do not ask for that approval again.
 
 ## Boundaries
 

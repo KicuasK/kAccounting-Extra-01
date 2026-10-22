@@ -1,0 +1,71 @@
+{
+  "source_thread": "01a16309-91c2-70f0-8ac8-da2b7870791b",
+  "kind": "design-mockups-not-implemented-ui",
+  "files": [
+    {
+      "file": "exec-1c3a4c4f-d265-4407-aac6-bd77645cb3e6.png",
+      "bytes": 1502903,
+      "sha256": "9ccf11744dbe60ab6005f5cf51475c3bea211e1e44086cfcdcd13d83df44820a"
+    },
+    {
+      "file": "exec-2297620a-387e-40b5-82fa-4cb4f3aa3d97.png",
+      "bytes": 1472731,
+      "sha256": "a406db07873eaf515308920ddcc6002214e6702e4957a98e9a15a0aedfdb02c3"
+    },
+    {
+      "file": "exec-586b3c40-45d4-4e46-80d9-ed3bcec9d9b8.png",
+      "bytes": 1310501,
+      "sha256": "fbb54e76f160c24ab8c7e2c8e72b33977550035c94702b0116967801175cd103"
+    },
+    {
+      "file": "exec-684acbe0-fc7e-4678-8b3c-4f033484a576.png",
+      "bytes": 1372869,
+      "sha256": "d2be4b5176e71a4c71f641e26264200188a6b50a1a86f9f625fda87dd4fc1f96"
+    },
+    {
+      "file": "exec-7b6bd051-5bf1-4207-a6cf-08cc59f663a8.png",
+      "bytes": 1193090,
+      "sha256": "a8d2a735474f65a5bba0177096aebc18984ab62aba138514bb1462b3fbbd5bbc"
+    },
+    {
+      "file": "exec-7f289002-934d-44da-a107-aed13aaa2924.png",
+      "bytes": 1526569,
+      "sha256": "bb640e429a3e6d03f1b8a61b14617b187990ecb9e2054cf9d2e4ddc9b8f7d1b2"
+    },
+    {
+      "file": "exec-89f7d149-164e-4499-b4c1-a1541cddc2a9.png",
+      "bytes": 1367963,
+      "sha256": "93f70ffbaa868f30e4f102f9f2f06ec0bd929563fc7c144c854eb97ca1d2c1a1"
+    },
+    {
+      "file": "exec-8f4f3ab6-ac64-4fb7-8ae1-a22c7cd07153.png",
+      "bytes": 1367516,
+      "sha256": "b70210aac84db98ea1d240bcfc03edd0054278771f9e3b25af3eb331840301a9"
+    },
+    {
+      "file": "exec-9f82d376-4c6e-459a-9b8e-4188f06956f2.png",
+      "bytes": 1433111,
+      "sha256": "88f79c2fbee4e5c35957e09fbb837406f9a8b6cee3329c9dcdd286468fc28ac5"
+    },
+    {
+      "file": "exec-a398b06d-d242-4c64-b051-7fbc40402c99.png",
+      "bytes": 1389213,
+      "sha256": "c8e1b0e14f7dc0a6421ab03daec589d0d909aa5b125e03ce36ef6269f560306a"
+    },
+    {
+      "file": "exec-a75a5904-fd0f-46b3-91ac-52ddf18fc011.png",
+      "bytes": 1312043,
+      "sha256": "d6aea85e3ac6de51ca1a0c2157d64a20b544712e93c5d6fb8d9d12ffe04c1f98"
+    },
+    {
+      "file": "exec-b76c74df-338b-4cae-882e-53870726db93.png",
+      "bytes": 1252911,
+      "sha256": "351550ceb3838816f510a4306274847d221b820c281bb50d055b5ac9b9766397"
+    },
+    {
+      "file": "exec-d8fb0ab3-1879-4843-b89b-d070317f6729.png",
+      "bytes": 1372621,
+      "sha256": "eed702ade27d09f0e0eccbd554cd0e1628eefbfb1f19162cd98a77ed48d7b906"
+    }
+  ]
+}
