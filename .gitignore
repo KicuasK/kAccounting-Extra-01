@@ -49,3 +49,16 @@ device-key.json
 .kAccounting-Extra-01-init-*/
 __pycache__/
 *.pyc
+
+# Machine-local, reviewed operator launchers; runtime state stays outside source
+/scripts/private-acceptance-local/
+
+# Interrupted transfer work must never enter source control
+.kAccounting-Extra-01-*.work/
+.kAccounting-Extra-01-recipient-import-*/
+.kAccounting-Extra-01-container-import-*/
+.kAccounting-Extra-01-ciphertext-*.partial/
+.migration-work-*/
+operation-state.json
+.operation-state.lock
+.operation-state-*.tmp

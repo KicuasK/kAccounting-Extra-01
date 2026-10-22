@@ -36,7 +36,12 @@ passphrase, PIN, or recovery phrase may be introduced.
 
 ## Attachments and transfer storage
 
-- Which removable-drive file systems must be supported for computer transfer?
+- Updated user scope on 2026-10-22: physical APFS/exFAT external-drive acceptance
+  is deferred to Version 02; no external drive is available. Preserve all existing
+  code/tests/tooling; this is not a Version 01 or UI-start blocker.
+- Resolved on 2026-10-22: computer transfer must cover APFS and exFAT. Physical
+  removable-drive acceptance and exFAT-safe staging/publication remain engineering
+  work; reformatting must not become an implicit workflow requirement.
 - How should the later iPad Safari workflow receive or send a directory package
   when Finder package semantics are unavailable?
 

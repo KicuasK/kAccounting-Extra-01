@@ -59,6 +59,7 @@ reject_rg_matches() {
 require_command cargo
 require_command find
 require_command rg
+require_command python3
 
 cd "$project_dir"
 
@@ -70,6 +71,9 @@ if ! runtime_data_files=$(find "$project_dir" \
        -o -name '*.kabackup' -o -name '*.kae' -o -name '*.kagextra' -o -name '*.kagextra.partial' \
        -o -name '.kAccounting-Extra-01-backup-*' -o -name '.kAccounting-Extra-01-object-*' \
        -o -name '.kAccounting-Extra-01-encrypted-backup-*.work' -o -name '.kAccounting-Extra-01-export-*.work' -o -name '.kAccounting-Extra-01-snapshot-*.work' \
+       -o -name '.kAccounting-Extra-01-*.work' -o -name '.migration-work-*' \
+       -o -name '.kAccounting-Extra-01-recipient-import-*' -o -name '.kAccounting-Extra-01-container-import-*' \
+       -o -name '.kAccounting-Extra-01-ciphertext-*.partial' \
        -o -name '.kAccounting-Extra-01-init-*' -o -name '*.managed' \
        -o -name '.runtime.lock' -o -name '.maintenance.lock' -o -name '.backup-service.lock' -o -name 'device-key.json' \
        -o -name 'operation-state.json' -o -name '.operation-state.lock' -o -name '.operation-state-*.tmp' \
@@ -82,6 +86,9 @@ if [[ -n "$runtime_data_files" ]]; then
     "Runtime databases, backups, transfer packages, and private work state must remain outside the source repository. Move these paths out of the checkout:" \
     "$runtime_data_files"
 fi
+
+run_step "Testing runtime tooling and source/runtime data separation..." \
+  python3 -B -m unittest discover -s "$script_dir" -p 'test_*.py'
 
 echo "Checking accounting money types..."
 reject_rg_matches \
@@ -108,7 +115,7 @@ reject_rg_matches \
   "Public listener or Tailscale Funnel configuration is prohibited:" \
   "the private-service boundary" \
   -n -i \
-  '0\.0\.0\.0|\[::\]|Ipv4Addr::UNSPECIFIED|Ipv6Addr::UNSPECIFIED|tailscale[[:space:]_-]+funnel|funnel[[:space:]_-]+on' \
+  '0\.0\.0\.0|\[::\]|Ipv4Addr::UNSPECIFIED|Ipv6Addr::UNSPECIFIED|tailscale[[:space:]_-]+funnel([[:space:]]|$)|funnel[[:space:]_-]+on' \
   "$project_dir/backend"
 
 if ! rg -q '^axum = \{[^}]*default-features = false' "$project_dir/backend/Cargo.toml"; then
@@ -120,8 +127,17 @@ reject_rg_matches \
   "network startup outside runtime.rs" \
   -n \
   --glob '!runtime.rs' \
-  'TcpListener|axum::serve|hyper::server|tokio::net' \
+  --glob '!private_ingress.rs' \
+  'TcpListener|UnixListener|axum::serve|hyper::server|tokio::net' \
   "$project_dir/backend/src"
+
+# This single audited boundary accepts an existing UnixStream only to inspect
+# kernel peer credentials. All listener/startup operations remain in runtime.rs.
+reject_rg_matches \
+  "Private ingress policy must not open listeners or outgoing connections:" \
+  "credential-only private ingress" \
+  -n 'TcpListener|UnixListener|axum::serve|hyper::server|::connect[[:space:]]*\(|::bind[[:space:]]*\(' \
+  "$project_dir/backend/src/private_ingress.rs"
 
 [[ -f "$project_dir/backend/tests/runtime.rs" ]] || \
   fail "Private runtime boundary tests are required before enabling serving."

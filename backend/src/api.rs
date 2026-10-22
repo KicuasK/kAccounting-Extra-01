@@ -10,7 +10,10 @@ use axum::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 mod book_commands;
+mod container_upload;
 mod mutations;
+mod storage_commands;
+mod transfer_download;
 use sqlx::SqlitePool;
 
 use crate::accounting::{
@@ -156,6 +159,14 @@ pub fn localhost_book_commands_router(
         book.pool().clone(),
         book_commands::attachment_routes(repository).merge(book_commands::backup_routes(book)),
     ))
+}
+
+/// Only locally registered path capabilities can authorize storage jobs.
+pub fn localhost_storage_router(
+    pool: SqlitePool,
+    operations: crate::storage_operations::StorageOperations,
+) -> Router {
+    protect_local_book_commands(pool, storage_commands::routes(operations))
 }
 
 fn protect_local_book_commands(pool: SqlitePool, routes: Router) -> Router {
@@ -962,6 +973,8 @@ enum ApiError {
     Conflict { code: &'static str, message: String },
     Forbidden,
     PayloadTooLarge,
+    AttachmentPayloadTooLarge,
+    TransferPayloadTooLarge,
     JsonRequired,
     Internal,
 }
@@ -1055,6 +1068,21 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     code: "body_too_large",
                     message: "JSON requests must not exceed 1 MiB.".to_owned(),
+                }),
+            )
+                .into_response(),
+            Self::TransferPayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ApiErrorBody {
+                    code: "transfer_payload_too_large",
+                    message: "The encrypted transfer exceeds this deployment's configured transport capacity.".to_owned(),
+                }),
+            ).into_response(),
+            Self::AttachmentPayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ApiErrorBody {
+                    code: "attachment_too_large",
+                    message: "An attachment must not exceed 250 MiB.".to_owned(),
                 }),
             )
                 .into_response(),

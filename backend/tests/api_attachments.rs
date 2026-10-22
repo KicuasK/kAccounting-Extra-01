@@ -271,7 +271,8 @@ async fn detach_rejects_noncanonical_revision_unknown_fields_and_path_import() {
             Some(r#"{"path":"/etc/passwd"}"#),
         )
         .await;
-    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(value["code"], "method_not_allowed");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "invalid_upload_metadata");
     assert!(f.repo.get(&f.attachment.id).await.is_ok());
+    assert_eq!(f.repo.list_for_entry(f.entry).await.unwrap().len(), 1);
 }

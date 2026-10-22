@@ -41,6 +41,7 @@ pub enum EncryptedObjectPurpose {
     TransferManifest = 4,
     TransferAttachment = 5,
     BackupManifest = 6,
+    TransferRecovery = 7,
 }
 
 impl EncryptedObjectPurpose {
@@ -49,6 +50,7 @@ impl EncryptedObjectPurpose {
             Self::Attachment => b"kAccounting-Extra-01/encrypted-object/v1/attachment",
             Self::Backup => b"kAccounting-Extra-01/encrypted-object/v1/backup",
             Self::BackupManifest => b"kAccounting-Extra-01/encrypted-object/v1/backup-manifest",
+            Self::TransferRecovery => b"kAccounting-Extra-01/encrypted-object/v1/transfer-recovery",
             Self::TransferDatabase => b"kAccounting-Extra-01/encrypted-object/v1/transfer-database",
             Self::TransferManifest => b"kAccounting-Extra-01/encrypted-object/v1/transfer-manifest",
             Self::TransferAttachment => {
@@ -69,6 +71,7 @@ impl TryFrom<u8> for EncryptedObjectPurpose {
             4 => Ok(Self::TransferManifest),
             5 => Ok(Self::TransferAttachment),
             6 => Ok(Self::BackupManifest),
+            7 => Ok(Self::TransferRecovery),
             _ => Err(EncryptedObjectError::UnsupportedPurpose(value)),
         }
     }
@@ -638,6 +641,50 @@ mod tests {
             EncryptedObjectError::PurposeMismatch { .. }
         ));
         assert!(plaintext.is_empty());
+    }
+
+    #[test]
+    fn every_object_purpose_is_separated_including_private_transfer_recovery() {
+        let purposes = [
+            EncryptedObjectPurpose::Attachment,
+            EncryptedObjectPurpose::Backup,
+            EncryptedObjectPurpose::TransferDatabase,
+            EncryptedObjectPurpose::TransferManifest,
+            EncryptedObjectPurpose::TransferAttachment,
+            EncryptedObjectPurpose::BackupManifest,
+            EncryptedObjectPurpose::TransferRecovery,
+        ];
+        let key = RootEncryptionKey::new(TEST_KEY_BYTES);
+        for purpose in purposes {
+            assert_eq!(
+                EncryptedObjectPurpose::try_from(purpose as u8).unwrap(),
+                purpose
+            );
+            let header = Header::from_material(purpose, TEST_SALT, TEST_NONCE);
+            let mut ciphertext = Vec::new();
+            encrypt_with_header(
+                &mut Cursor::new(b"purpose-bound secret"),
+                &mut ciphertext,
+                &key,
+                header,
+            )
+            .unwrap();
+            for candidate in purposes {
+                let mut output = Vec::new();
+                let result =
+                    decrypt_object(&mut Cursor::new(&ciphertext), &mut output, &key, candidate);
+                if candidate == purpose {
+                    result.unwrap();
+                    assert_eq!(output, b"purpose-bound secret");
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(EncryptedObjectError::PurposeMismatch { .. })
+                    ));
+                    assert!(output.is_empty());
+                }
+            }
+        }
     }
 
     struct BoundedReader {

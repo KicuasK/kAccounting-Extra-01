@@ -50,6 +50,8 @@ pub enum RuntimeError {
     #[error(transparent)]
     Database(#[from] db::DatabaseError),
     #[error(transparent)]
+    MigrationBackup(#[from] crate::migration_backup::MigrationBackupError),
+    #[error(transparent)]
     Backup(#[from] book_backup::BookBackupError),
     #[error(transparent)]
     BackupIdentity(#[from] crate::backup_service::BackupServiceError),
@@ -57,6 +59,12 @@ pub enum RuntimeError {
     Attachment(#[from] crate::attachments::AttachmentError),
     #[error("new book could not be published without replacing an existing destination")]
     Publish,
+    #[error("private runtime startup worker failed")]
+    Worker,
+    #[error(transparent)]
+    NativeHost(#[from] crate::native_host::NativeHostError),
+    #[error(transparent)]
+    PrivateIngress(#[from] crate::private_ingress::IngressError),
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +72,51 @@ struct Binding {
     format: String,
     version: u32,
     key_id: String,
+}
+
+/// Existing key and process lock for recovery without opening a possibly
+/// damaged database or trying to resume its interrupted migration.
+pub struct RecoveryBookKey {
+    key_id: DeviceKeyId,
+    key: Arc<RootEncryptionKey>,
+    _lock: File,
+}
+impl RecoveryBookKey {
+    pub fn key_id(&self) -> &DeviceKeyId {
+        &self.key_id
+    }
+    pub fn key(&self) -> Arc<RootEncryptionKey> {
+        self.key.clone()
+    }
+}
+pub fn load_recovery_book_key(
+    path: impl AsRef<Path>,
+    store: &impl DeviceKeyStore,
+) -> Result<RecoveryBookKey, RuntimeError> {
+    let root = private_directory(path.as_ref())?;
+    outside_source(&root)?;
+    let lock = lock_book(&root)?;
+    let path = root.join("device-key.json");
+    private_regular(&path)?;
+    let mut bytes = Vec::new();
+    let file = open_regular_file_without_symlink(&path)?;
+    (&file).take(4097).read_to_end(&mut bytes)?;
+    crate::storage::ensure_path_still_names_open_file(&path, &file)?;
+    if bytes.len() > 4096 {
+        return Err(RuntimeError::InvalidBinding);
+    }
+    let binding: Binding =
+        serde_json::from_slice(&bytes).map_err(|_| RuntimeError::InvalidBinding)?;
+    if binding.format != BINDING_FORMAT || binding.version != 1 {
+        return Err(RuntimeError::InvalidBinding);
+    }
+    let key_id = DeviceKeyId::parse(&binding.key_id).map_err(|_| RuntimeError::InvalidBinding)?;
+    let key = Arc::new(load_device_key(store, &key_id)?);
+    Ok(RecoveryBookKey {
+        key_id,
+        key,
+        _lock: lock,
+    })
 }
 
 /// Holds the process lock and encryption key for the entire server lifetime.
@@ -99,8 +152,8 @@ impl RuntimeBook {
         self.pool.close().await;
     }
 
-    /// Existing-schema audit happens before writable opening. Legacy schemas
-    /// require the separate backup-first upgrade workflow rather than migration.
+    /// Legacy upgrades require an independently verified encrypted backup
+    /// before the live database receives a writable handle.
     pub async fn open_existing(
         path: impl AsRef<Path>,
         store: &impl DeviceKeyStore,
@@ -112,6 +165,7 @@ impl RuntimeBook {
         if !recovered.unrecognized_work.is_empty() {
             return Err(RuntimeError::RecoveryRequired);
         }
+        recover_managed_backup_work(&root)?;
         let binding_path = root.join("device-key.json");
         private_regular(&binding_path)?;
         let mut bytes = Vec::new();
@@ -139,16 +193,26 @@ impl RuntimeBook {
         private_directory(&root.join("attachments"))?;
         let database = root.join("book.sqlite3");
         private_regular(&database)?;
-        db::verify_database_snapshot(&database).await?;
-        let pool = db::open_database(&database).await?;
-        Ok(Self {
-            pool,
-            root,
-            key_id,
-            key,
-            backup_id,
-            _lock: lock,
+        // Own the process lock through completion even if the selecting client
+        // disconnects or its future is cancelled while SQLite is working.
+        tokio::spawn(async move {
+            crate::migration_backup::prepare_upgrade(&root, &key_id, &key).await?;
+            // Legacy schemas were audited on a disposable upgraded copy first.
+            if !db::pending_schema_migrations(&database).await? {
+                db::verify_database_snapshot(&database).await?;
+            }
+            let pool = db::open_database(&database).await?;
+            Ok(Self {
+                pool,
+                root,
+                key_id,
+                key,
+                backup_id,
+                _lock: lock,
+            })
         })
+        .await
+        .map_err(|_| RuntimeError::Worker)?
     }
 
     /// Explicit initialization creates a new directory only. A failed
@@ -197,6 +261,50 @@ impl RuntimeBook {
         File::open(parent)?.sync_all()?;
         Ok(destination)
     }
+}
+
+/// Only the explicitly owned backups root and exact generated managed names
+/// are inspected. Arbitrary directories and completed packages are not walked.
+fn recover_managed_backup_work(root: &Path) -> Result<(), RuntimeError> {
+    let backups = root.join("backups");
+    if !backups.try_exists()? {
+        return Ok(());
+    }
+    private_directory(&backups)?;
+    let result = book_backup::recover_interrupted_local_backup_work(&backups)?;
+    if !result.unrecognized_work.is_empty() {
+        return Err(RuntimeError::RecoveryRequired);
+    }
+    for entry in std::fs::read_dir(&backups)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".managed") else {
+            continue;
+        };
+        let parts: Vec<_> = stem.split('-').collect();
+        let hex = |s: &str| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if parts.len() != 3
+            || !hex(parts[0])
+            || parts[1].len() != 39
+            || !parts[1].bytes().all(|b| b.is_ascii_digit())
+            || !hex(parts[2])
+        {
+            continue;
+        }
+        private_directory(&entry.path())?;
+        let result = book_backup::recover_interrupted_local_backup_work(entry.path())?;
+        if !result.unrecognized_work.is_empty() {
+            return Err(RuntimeError::RecoveryRequired);
+        }
+    }
+    Ok(())
 }
 
 fn outside_source(path: &Path) -> Result<(), RuntimeError> {
@@ -286,6 +394,13 @@ pub fn application_router(
     pool: SqlitePool,
     frontend_dist: impl AsRef<Path>,
 ) -> Result<Router, RuntimeError> {
+    let static_routes = static_router(frontend_dist)?;
+    Ok(api::localhost_write_router(pool)
+        .merge(static_routes)
+        .layer(middleware::from_fn(local_boundary)))
+}
+
+pub(crate) fn static_router(frontend_dist: impl AsRef<Path>) -> Result<Router, RuntimeError> {
     let assets = frontend_dist.as_ref().canonicalize()?;
     if !assets.is_dir() {
         return Err(RuntimeError::UnsafePath);
@@ -295,9 +410,7 @@ pub fn application_router(
         .route("/", get(index))
         .route("/assets/{*path}", get(asset))
         .with_state(Assets(Arc::new(assets)));
-    Ok(api::localhost_write_router(pool)
-        .merge(static_routes)
-        .layer(middleware::from_fn(local_boundary)))
+    Ok(static_routes)
 }
 async fn index(State(assets): State<Assets>) -> Response {
     asset_response(&assets.0, "index.html")
@@ -342,7 +455,7 @@ fn asset_response(root: &Path, relative: &str) -> Response {
     }
     ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
-async fn local_boundary(request: Request<Body>, next: Next) -> Response {
+pub(crate) async fn local_boundary(request: Request<Body>, next: Next) -> Response {
     let headers = request.headers();
     let hosts = headers.get_all(header::HOST);
     let origins = headers.get_all(header::ORIGIN);
@@ -399,4 +512,160 @@ pub async fn serve(
         .await?;
     book.close().await;
     Ok(())
+}
+
+/// Start with no book selected, even when the collection contains one book.
+pub async fn serve_session(
+    session: crate::session_runtime::SessionRuntime,
+) -> Result<(), RuntimeError> {
+    let result = serve_loopback_router(session.router()).await;
+    session.shutdown().await;
+    result
+}
+
+/// Serve the trusted native composition without automatically invoking a panel.
+/// The caller owns explicit native user actions; HTTP never opens a panel.
+pub async fn serve_native_host(host: crate::native_host::NativeHost) -> Result<(), RuntimeError> {
+    let result = serve_loopback_router(host.router()).await;
+    host.shutdown().await?;
+    result
+}
+
+async fn serve_loopback_router(router: Router) -> Result<(), RuntimeError> {
+    let listener = tokio::net::TcpListener::bind(LOCAL_ADDRESS).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+
+/// Explicit, undeployed private ingress. A Unix peer must be kernel-verified
+/// root before any proxy identity header can authorize a request. This function
+/// does not configure Tailscale or expose a TCP listener.
+pub async fn serve_private_session(
+    session: crate::session_runtime::SessionRuntime,
+    policy: crate::private_access::PrivateAccessPolicy,
+    socket: impl AsRef<Path>,
+) -> Result<(), RuntimeError> {
+    let result = serve_private_router(session.router(), policy, socket.as_ref()).await;
+    session.shutdown().await;
+    result
+}
+
+/// Same authenticated Unix ingress with an explicitly configured native host.
+/// Helper pinning does not open a panel and this does not configure private Serve.
+pub async fn serve_private_native_host(
+    host: crate::native_host::NativeHost,
+    policy: crate::private_access::PrivateAccessPolicy,
+    socket: impl AsRef<Path>,
+) -> Result<(), RuntimeError> {
+    let result = serve_private_router(host.router(), policy, socket.as_ref()).await;
+    host.shutdown().await?;
+    result
+}
+
+async fn serve_private_router(
+    router: Router,
+    policy: crate::private_access::PrivateAccessPolicy,
+    path: &Path,
+) -> Result<(), RuntimeError> {
+    let socket = crate::private_ingress::SocketPath::prepare(path)?;
+    socket.validate_parent()?;
+    let listener = tokio::net::UnixListener::bind(socket.path())?;
+    std::fs::set_permissions(socket.path(), std::fs::Permissions::from_mode(0o600))?;
+    socket.validate_bound()?;
+    let service = tower::service_fn(
+        move |connection: axum::serve::IncomingStream<'_, tokio::net::UnixListener>| {
+            let proof = crate::private_ingress::RootProxyConnection::authenticate(connection.io())
+                .ok()
+                .map(Arc::new);
+            let router = private_connection_router(router.clone(), policy.clone(), proof);
+            async move { Ok::<_, std::convert::Infallible>(router) }
+        },
+    );
+    axum::serve(listener, service)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    // Keep the socket pathname for explicit inspection. Never unlink a stale
+    // or substituted socket automatically; a fresh path is required on retry.
+    Ok(())
+}
+
+fn private_connection_router(
+    router: Router,
+    policy: crate::private_access::PrivateAccessPolicy,
+    proof: Option<Arc<crate::private_ingress::RootProxyConnection>>,
+) -> Router {
+    router.layer(middleware::from_fn(
+        move |mut request: Request<Body>, next: Next| {
+            let proof = proof.clone();
+            let policy = policy.clone();
+            async move {
+                let method = request.method().clone();
+                if proof.as_ref().is_none_or(|proof| {
+                    proof
+                        .authorize_local(&policy, request.headers_mut(), &method)
+                        .is_err()
+                }) {
+                    let mut response = (
+                        StatusCode::FORBIDDEN,
+                        axum::Json(serde_json::json!({
+                            "error": {"code": "private_ingress_denied"}
+                        })),
+                    )
+                        .into_response();
+                    response.headers_mut().insert(
+                        "cache-control",
+                        header::HeaderValue::from_static("no-store"),
+                    );
+                    response.headers_mut().insert(
+                        "x-content-type-options",
+                        header::HeaderValue::from_static("nosniff"),
+                    );
+                    return response;
+                }
+                next.run(request).await
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
+mod private_connection_tests {
+    use super::*;
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn forged_identity_never_reaches_routes_without_transport_proof() {
+        let router = Router::new().fallback(|| async { "must not reach protected application" });
+        let policy = crate::private_access::PrivateAccessPolicy::new(
+            "book.example.ts.net",
+            "owner@example.com",
+        )
+        .unwrap();
+        let protected = private_connection_router(router, policy, None);
+        for method in ["GET", "POST", "DELETE"] {
+            let response = protected
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/session")
+                        .header("host", "localhost")
+                        .header("x-forwarded-host", "book.example.ts.net")
+                        .header("x-forwarded-proto", "https")
+                        .header("tailscale-user-login", "owner@example.com")
+                        .header("origin", "https://book.example.ts.net")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+    }
 }

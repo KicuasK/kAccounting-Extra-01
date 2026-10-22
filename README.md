@@ -8,6 +8,13 @@ Private, single-user double-entry accounting software for a Mac Studio, with a R
 [換電腦建置與開發交接](docs/HANDOFF_NEW_MAC.md) for clone/setup commands,
 verified tool versions, current limitations, and the next implementation steps.
 
+Latest non-UI increment: [30-minute pre-UI integration](docs/BUILD_30MIN_2026-10-22.md)
+adds undeployed root-peer Unix ingress, disabled installation-readiness plans,
+safe Keychain diagnostics and native-selection epoch protection. Actual non-root
+Unix forgery refusal passed; real private Tailscale/TLS positive, enabled login
+and complete native GUI acceptance remain open. Final integrated verification
+for that increment is recorded in its report.
+
 The project has a tested Rust/TypeScript accounting foundation with exact TWD
 integers, balanced atomic posting, versioned explicit drafts, immutable
 reversal/correction relationships, journal references/explanations/line memos,
@@ -20,23 +27,40 @@ attachments, file/book quotas, authenticated streaming, and independent content
 verification. Local device-key backup/restore primitives automatically select
 attachments from consistent database snapshots and publish verified results
 without replacement. A compiled macOS Keychain adapter and tested key-storage
-boundary never introduce an application password. Existing `.kagextra` storage
-foundations remain. Strict public recipient requests and RFC 9180 HPKE
-destination-bound root-key envelopes are implemented and tested; complete
-encrypted package export/import integration is still pending.
+boundary never introduce an application password. Encrypted `.kagextra`
+export/import now connects strict public recipient requests, RFC 9180 HPKE,
+full database/attachment verification, fresh local attachment encryption and
+non-overwriting publication. Export restart recovery verifies persisted work;
+import restart handling and its remaining limits are described in
+[recipient transfer](docs/RECIPIENT_TRANSFER.md).
 
 The private runtime now supports explicit new-book initialization and opening
 an existing verified book with its existing Keychain key. It serves the frontend
 and guarded write APIs only at `127.0.0.1:3000`, holds an exclusive book lock,
-and fails closed on missing keys or older schemas. Managed local backups have
+and fails closed on missing keys. Recognized older schemas receive an
+independently verified encrypted checkpoint before migration; damaged databases
+can be restored from those checkpoints into new destinations. Managed backups have
 authenticated per-book identity and conservative newest-ten retention.
 
 The current Catalina-style account-tree UI remains read-only. **This is an
 integration preview, not a Version 01 release.** Remaining work includes
-attachment upload/download, complete backup/migration/restore commands,
-encrypted package export/import, private Tailscale integration, installation,
-write UI, and real Keychain/Mac Safari acceptance. Development tests use
+private Tailscale integration,
+installation/login acceptance, write UI, and complete Mac Safari acceptance.
+Physical APFS/exFAT external-drive acceptance is deferred to Version 02 by the
+user (2026-10-22); all existing code, tests and media tooling are preserved.
+Attachment upload/download uses bounded HTTP streaming. Each startup requires
+an explicit book choice; import and restore never select a book automatically.
+Development tests use
 disposable books and fake key stores. No service is started automatically.
+
+The second 45-minute session adds explicit HTTP book sessions, capability-only
+storage jobs, ciphertext-only portable export staging, bounded single-file
+transfer download/import, and independent cross-module acceptance. Two newly
+created dedicated Keychain items passed actual production-adapter checks and
+were retained as requested; locked-Keychain and login behavior remain untested.
+No physical APFS/exFAT pass is claimed. See the
+[twelve-agent session report](docs/BUILD_12_AGENTS_45MIN_2026-10-22.md) and
+[independent release audit](docs/RELEASE_AUDIT_R2_2026-10-22.md).
 
 See [private local runtime instructions](docs/LOCAL_RUNTIME.md) for explicit
 commands and the launcher generator, which prepares a plist without installing

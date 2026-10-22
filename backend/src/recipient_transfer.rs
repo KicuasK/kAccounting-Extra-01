@@ -141,6 +141,19 @@ struct EnvelopeDocument {
 }
 
 impl RecipientEnvelope {
+    /// Canonical package identity, validated when the envelope is decoded.
+    pub fn package_id(&self) -> &str {
+        &self.0.package_id
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.0.request_id
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.0.public_key_sha256
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self, RecipientTransferError> {
         let envelope = Self(parse_document(bytes)?);
         envelope.validate()?;

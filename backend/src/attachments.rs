@@ -26,7 +26,7 @@ use crate::{
     },
     storage::{
         ContentDigest, StoredObjectDescriptor, StoredObjectVerificationError, describe_file,
-        ensure_directory_still_matches, ensure_path_still_names_open_file,
+        describe_reader, ensure_directory_still_matches, ensure_path_still_names_open_file,
         open_regular_file_without_symlink, verify_file,
     },
 };
@@ -125,6 +125,7 @@ struct AttachmentStore {
     identity: std::fs::Metadata,
     key: Arc<RootEncryptionKey>,
     pin: StorePin,
+    streams: Arc<tokio::sync::Semaphore>,
 }
 
 impl AttachmentRepository {
@@ -172,6 +173,7 @@ impl AttachmentRepository {
                     }
                     _ => AttachmentError::UnsafeStore,
                 })?,
+                streams: Arc::new(tokio::sync::Semaphore::new(4)),
                 root: candidate,
                 identity,
                 key,
@@ -203,6 +205,54 @@ impl AttachmentRepository {
         let prepared = tokio::task::spawn_blocking(move || store.prepare(&source, name))
             .await
             .map_err(|_| AttachmentError::Worker)??;
+        self.publish(entry_id, prepared, None, false).await
+    }
+
+    /// Encrypts a bounded, fallible byte stream without a plaintext intermediate.
+    /// EOF must be explicit: a disconnected producer aborts rather than publishes.
+    pub async fn import_stream<R: Read + Send + 'static>(
+        &self,
+        entry_id: JournalEntryId,
+        display_name: &str,
+        expected_revision: Option<i64>,
+        input: R,
+    ) -> Result<Attachment, AttachmentError> {
+        validate_display_name(display_name)?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM journal_entries WHERE id = ?)")
+                .bind(entry_id.get())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(AttachmentError::Database)?;
+        if !exists {
+            return Err(AttachmentError::EntryNotFound);
+        }
+        let permit = self
+            .store
+            .streams
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AttachmentError::Worker)?;
+        let store = self.store.clone();
+        let name = display_name.to_owned();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            store.prepare_stream(input, name)
+        })
+        .await
+        .map_err(|_| AttachmentError::Worker)??;
+        self.publish(entry_id, prepared, expected_revision, true)
+            .await
+    }
+
+    async fn publish(
+        &self,
+        entry_id: JournalEntryId,
+        prepared: PreparedAttachment,
+        expected_revision: Option<i64>,
+        enforce_revision: bool,
+    ) -> Result<Attachment, AttachmentError> {
         // The writer lock coordinates publication/reference creation with any
         // offline reference-based maintenance. Encryption runs before this lock.
         let mut tx = self
@@ -218,6 +268,31 @@ impl AttachmentRepository {
                 .map_err(AttachmentError::Database)?;
         if !exists {
             return Err(AttachmentError::EntryNotFound);
+        }
+        if enforce_revision {
+            let (status, revision): (String, i64) =
+                sqlx::query_as("SELECT status, revision FROM journal_entries WHERE id = ?")
+                    .bind(entry_id.get())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(AttachmentError::Database)?;
+            if status == "draft" {
+                if Some(revision) != expected_revision {
+                    return Err(AttachmentError::StaleDraft);
+                }
+                if revision == i64::MAX {
+                    return Err(AttachmentError::RevisionExhausted);
+                }
+                sqlx::query("UPDATE journal_entries SET revision = revision + 1 WHERE id = ?")
+                    .bind(entry_id.get())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(AttachmentError::Database)?;
+            } else if status != "posted" {
+                return Err(AttachmentError::Integrity);
+            } else if expected_revision.is_some() {
+                return Err(AttachmentError::StaleDraft);
+            }
         }
         let created_at: String = sqlx::query_scalar("INSERT INTO attachments (id, entry_id, display_name, plaintext_sha256, byte_length, ciphertext_sha256, ciphertext_byte_length) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING created_at")
             .bind(prepared.id.as_str()).bind(entry_id.get()).bind(&prepared.name)
@@ -333,6 +408,82 @@ impl AttachmentRepository {
             .map_err(|_| AttachmentError::Worker)?
     }
 
+    /// Authenticates the complete object before HTTP sends headers, then streams
+    /// a second authenticated pass through a two-frame channel. Disconnecting
+    /// the receiver aborts decryption. Never writes decrypted bytes to disk.
+    pub async fn download_stream(
+        &self,
+        id: &AttachmentId,
+    ) -> Result<
+        (
+            Attachment,
+            tokio::sync::mpsc::Receiver<Result<Vec<u8>, io::Error>>,
+        ),
+        AttachmentError,
+    > {
+        let attachment = self.get(id).await?;
+        let permit = self
+            .store
+            .streams
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AttachmentError::Worker)?;
+        let store = self.store.clone();
+        let metadata = attachment.clone();
+        let (store, mut input, permit) = tokio::task::spawn_blocking(move || {
+            store.validate()?;
+            let path = store.object_path(&metadata.id);
+            let mut input = open_regular_file_without_symlink(&path)?;
+            if describe_reader(&mut input)? != metadata.ciphertext {
+                return Err(AttachmentError::Integrity);
+            }
+            input.rewind()?;
+            let mut hash = HashState::new();
+            decrypt_object(
+                &mut input,
+                &mut hash,
+                &store.key,
+                EncryptedObjectPurpose::Attachment,
+            )?;
+            if hash.finish() != metadata.plaintext {
+                return Err(AttachmentError::Integrity);
+            }
+            ensure_path_still_names_open_file(&path, &input)?;
+            input.rewind()?;
+            Ok::<_, AttachmentError>((store, input, permit))
+        })
+        .await
+        .map_err(|_| AttachmentError::Worker)??;
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let expected = attachment.plaintext;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut output = ChannelWriter {
+                sender: sender.clone(),
+                hash: HashState::new(),
+            };
+            let result = decrypt_object(
+                &mut input,
+                &mut output,
+                &store.key,
+                EncryptedObjectPurpose::Attachment,
+            )
+            .map_err(io::Error::other)
+            .and_then(|_| {
+                if output.hash.finish() == expected {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("attachment integrity failed"))
+                }
+            });
+            if let Err(error) = result {
+                let _ = sender.blocking_send(Err(error));
+            }
+        });
+        Ok((attachment, receiver))
+    }
+
     /// Lists all object descriptors owned by the selected database snapshot. The supplied
     /// pool may be a read-only snapshot, so deletion from the live book cannot
     /// silently remove the export's selected attachment set.
@@ -442,6 +593,63 @@ impl AttachmentStore {
             work,
         })
     }
+    fn prepare_stream(
+        &self,
+        mut input: impl Read,
+        name: String,
+    ) -> Result<PreparedAttachment, AttachmentError> {
+        self.validate()?;
+        // Read exactly the signature prefix across arbitrary HTTP chunk boundaries.
+        let mut prefix = Vec::with_capacity(8);
+        while prefix.len() < 8 {
+            let mut bytes = [0; 8];
+            let remaining = 8 - prefix.len();
+            let n = input.read(&mut bytes[..remaining])?;
+            if n == 0 {
+                break;
+            }
+            prefix.extend_from_slice(&bytes[..n]);
+        }
+        if is_executable(&name, &prefix) {
+            return Err(AttachmentError::UnsafeSource);
+        }
+        let id = AttachmentId::generate()?;
+        let work = PrivateWork::create(&self.root, &id)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut output = options.open(work.file())?;
+        let mut reader = HashingReader {
+            inner: io::Cursor::new(prefix)
+                .chain(input)
+                .take(MAX_ATTACHMENT_BYTES + 1),
+            hash: HashState::new(),
+        };
+        let outcome = encrypt_object(
+            &mut reader,
+            &mut output,
+            &self.key,
+            EncryptedObjectPurpose::Attachment,
+        )?;
+        if outcome.plaintext_byte_length > MAX_ATTACHMENT_BYTES {
+            return Err(AttachmentError::FileTooLarge);
+        }
+        let plaintext = reader.hash.finish();
+        output.sync_all()?;
+        drop(output);
+        let ciphertext = describe_file(work.file())?;
+        verify_encrypted_file(&work.file(), plaintext, ciphertext, &self.key)?;
+        File::open(&work.directory)?.sync_all()?;
+        self.validate()?;
+        Ok(PreparedAttachment {
+            id,
+            name,
+            plaintext,
+            ciphertext,
+            work,
+        })
+    }
     fn verify_attachment(&self, attachment: &Attachment) -> Result<(), AttachmentError> {
         self.validate()?;
         verify_encrypted_file(
@@ -514,6 +722,27 @@ impl Drop for PrivateWork {
             let _ = std::fs::remove_file(self.file());
             let _ = std::fs::remove_dir(&self.directory);
         }
+    }
+}
+
+struct ChannelWriter {
+    sender: tokio::sync::mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    hash: HashState,
+}
+impl Write for ChannelWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.hash.write_all(bytes)?;
+        // Encryption frames are at most 64 KiB. Keep that bound even if the
+        // codec changes its write batching in a future version.
+        for chunk in bytes.chunks(64 * 1024) {
+            self.sender
+                .blocking_send(Ok(chunk.to_vec()))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "download disconnected"))?;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

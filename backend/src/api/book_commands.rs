@@ -3,21 +3,212 @@ use super::{ApiError, ExactInteger, parse_journal_entry_id};
 use crate::attachments::{Attachment, AttachmentError, AttachmentId, AttachmentRepository};
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    body::{Body, HttpBody},
+    extract::{
+        Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::Response,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 
 pub(super) fn attachment_routes(repository: AttachmentRepository) -> Router {
     Router::new()
-        .route("/api/journal/entries/{entry_id}/attachments", get(list))
+        .route(
+            "/api/journal/entries/{entry_id}/attachments",
+            get(list).post(upload),
+        )
+        .route("/api/attachments/{attachment_id}/content", get(download))
         .route(
             "/api/attachments/{attachment_id}",
             get(metadata).delete(detach),
         )
         .route("/api/attachments/{attachment_id}/verify", post(verify))
         .with_state(repository)
+}
+
+// The request body is read as frames, bypassing JSON buffering. Both the
+// bridge and synchronous codec use at most two 64 KiB payload chunks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadInput {
+    display_name: String,
+    expected_revision: Option<String>,
+    source_kind: String,
+}
+async fn upload(
+    State(repository): State<AttachmentRepository>,
+    Path(entry_id): Path<String>,
+    input: Result<Query<UploadInput>, QueryRejection>,
+    headers: HeaderMap,
+    mut body: Body,
+) -> Result<(StatusCode, Json<AttachmentResponse>), ApiError> {
+    let entry_id = parse_journal_entry_id(&entry_id)?;
+    let Query(input) = input.map_err(|_| ApiError::BadRequest { code: "invalid_upload_metadata", message: "Send display_name, source_kind=regular_file, and the current expected_revision for a draft.".to_owned() })?;
+    if headers.get("content-type").and_then(|v| v.to_str().ok()) != Some("application/octet-stream")
+    {
+        return Err(ApiError::BadRequest {
+            code: "binary_body_required",
+            message: "Send the regular file bytes as application/octet-stream.".to_owned(),
+        });
+    }
+    if input.source_kind != "regular_file" {
+        return Err(ApiError::BadRequest {
+            code: "unsafe_attachment_source",
+            message: "Select a regular file; directories and packages are not supported."
+                .to_owned(),
+        });
+    }
+    let revision = input.expected_revision.as_deref().map(|value| {
+        value.parse::<i64>().ok().filter(|n| *n > 0 && n.to_string() == value).ok_or(ApiError::BadRequest { code: "invalid_revision", message: "Use a canonical positive revision string for a draft; omit it for a posted entry.".to_owned() })
+    }).transpose()?;
+    let declared = headers
+        .get("content-length")
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or(ApiError::BadRequest {
+                    code: "invalid_content_length",
+                    message: "Invalid Content-Length.".to_owned(),
+                })
+        })
+        .transpose()?;
+    if declared.is_some_and(|n| n > crate::attachments::MAX_ATTACHMENT_BYTES) {
+        return Err(ApiError::AttachmentPayloadTooLarge);
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let reader = UploadReader {
+        receiver,
+        current: std::io::Cursor::new(Vec::new()),
+        finished: false,
+    };
+    let consume = repository.import_stream(entry_id, &input.display_name, revision, reader);
+    let pump = async move {
+        let mut total = 0u64;
+        while let Some(frame) =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+        {
+            let frame = frame.map_err(|_| ApiError::BadRequest {
+                code: "attachment_upload_interrupted",
+                message: "The upload did not complete. Retry the whole file.".to_owned(),
+            })?;
+            if let Ok(bytes) = frame.into_data() {
+                total = total
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(ApiError::AttachmentPayloadTooLarge)?;
+                if total > crate::attachments::MAX_ATTACHMENT_BYTES {
+                    return Err(ApiError::AttachmentPayloadTooLarge);
+                }
+                for chunk in bytes.chunks(64 * 1024) {
+                    if sender.send(Some(chunk.to_vec())).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if declared.is_some_and(|n| n != total) {
+            return Err(ApiError::BadRequest {
+                code: "attachment_length_mismatch",
+                message: "The upload length did not match Content-Length.".to_owned(),
+            });
+        }
+        let _ = sender.send(None).await;
+        Ok(())
+    };
+    let (result, pumped) = tokio::join!(consume, pump);
+    // Prefer actual transport/size failures to the crypto worker's interrupted
+    // input error. In either case there is no published database reference.
+    pumped?;
+    Ok((
+        StatusCode::CREATED,
+        Json(result.map_err(attachment_error)?.into()),
+    ))
+}
+struct UploadReader {
+    receiver: tokio::sync::mpsc::Receiver<Option<Vec<u8>>>,
+    current: std::io::Cursor<Vec<u8>>,
+    finished: bool,
+}
+impl std::io::Read for UploadReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let n = self.current.read(bytes)?;
+            if n > 0 || self.finished {
+                return Ok(n);
+            }
+            match self.receiver.blocking_recv() {
+                Some(Some(chunk)) => self.current = std::io::Cursor::new(chunk),
+                Some(None) => self.finished = true,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "upload disconnected",
+                    ));
+                }
+            }
+        }
+    }
+}
+struct DownloadStream(tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>);
+impl futures_core::Stream for DownloadStream {
+    type Item = Result<Vec<u8>, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+async fn download(
+    State(repository): State<AttachmentRepository>,
+    Path(attachment_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let (attachment, receiver) = repository
+        .download_stream(&parse_id(&attachment_id)?)
+        .await
+        .map_err(attachment_error)?;
+    let mut response = Response::new(Body::from_stream(DownloadStream(receiver)));
+    let headers = response.headers_mut();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        "content-length",
+        HeaderValue::from_str(&attachment.plaintext.byte_length().to_string())
+            .map_err(|_| ApiError::Internal)?,
+    );
+    // An ASCII fallback plus RFC 5987 encoding preserves Chinese filenames and
+    // prevents names from injecting header syntax or enabling inline scripts.
+    let encoded: String = attachment
+        .display_name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    headers.insert(
+        "content-disposition",
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"attachment\"; filename*=UTF-8''{encoded}"
+        ))
+        .map_err(|_| ApiError::Internal)?,
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 #[derive(Serialize)]
@@ -116,10 +307,14 @@ async fn detach(
 }
 fn attachment_error(error: AttachmentError) -> ApiError {
     match error {
+        AttachmentError::InvalidName => ApiError::BadRequest { code: "invalid_attachment_name", message: "Use a plain display filename of 1 to 255 non-control characters.".to_owned() },
+        AttachmentError::UnsafeSource => ApiError::BadRequest { code: "unsafe_attachment_source", message: "Executables and packages are not supported.".to_owned() },
+        AttachmentError::FileTooLarge => ApiError::AttachmentPayloadTooLarge,
+        AttachmentError::BookQuotaExceeded => ApiError::Conflict { code: "attachment_book_quota_exceeded", message: "The book attachment limit is 20 GiB.".to_owned() },
         AttachmentError::InvalidId => ApiError::BadRequest { code: "invalid_attachment_id", message: "Use a 32 character lowercase hexadecimal attachment identifier.".to_owned() },
         AttachmentError::NotFound => ApiError::NotFound { code: "attachment_not_found", message: "The attachment was not found.".to_owned() },
         AttachmentError::EntryNotFound => ApiError::NotFound { code: "entry_not_found", message: "The journal entry was not found.".to_owned() },
-        AttachmentError::StaleDraft => ApiError::Conflict { code: "stale_draft", message: "The draft changed. Reload it before removing an attachment.".to_owned() },
+        AttachmentError::StaleDraft => ApiError::Conflict { code: "stale_draft", message: "The draft changed or the attachment revision is invalid. Reload the entry; include the current revision for drafts and omit it for posted entries.".to_owned() },
         AttachmentError::PostedImmutable => ApiError::Conflict { code: "posted_attachment_immutable", message: "Posted attachment references cannot be removed.".to_owned() },
         AttachmentError::RevisionExhausted => ApiError::Conflict { code: "revision_exhausted", message: "The draft revision is exhausted.".to_owned() },
         AttachmentError::Integrity | AttachmentError::Crypto(_) | AttachmentError::Verification(_) => ApiError::Conflict { code: "attachment_integrity_failed", message: "Attachment integrity verification failed. Preserve the book and restore a verified backup.".to_owned() },

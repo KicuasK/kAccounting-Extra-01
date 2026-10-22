@@ -41,6 +41,9 @@ fn destination_recovers_transfer_root_and_decrypts_payload_without_exporting_sec
     let (source_key, envelope) = create_transfer_key(&parsed, PACKAGE).unwrap();
     let public_envelope = envelope.to_json().unwrap();
     let envelope = RecipientEnvelope::from_json(&public_envelope).unwrap();
+    assert_eq!(envelope.package_id(), PACKAGE);
+    assert_eq!(envelope.request_id(), request.request_id());
+    assert_eq!(envelope.fingerprint(), request.fingerprint());
     let recipient_key = unwrap_transfer_key(&store, &request, PACKAGE, &envelope).unwrap();
     let mut ciphertext = Vec::new();
     encrypt_object(

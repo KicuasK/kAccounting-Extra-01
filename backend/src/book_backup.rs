@@ -522,13 +522,11 @@ fn build_package(
         });
     }
     catalog.attachments.sort_by(|a, b| a.id.cmp(&b.id));
-    let bytes = serde_json::to_vec(&catalog).map_err(|_| BookBackupError::InvalidFormat)?;
-    if bytes.len() > MAX_CATALOG_BYTES {
-        return Err(BookBackupError::CatalogTooLarge);
-    }
+    let mut bytes = BoundedBytes(Vec::new());
+    serde_json::to_writer(&mut bytes, &catalog).map_err(|_| BookBackupError::CatalogTooLarge)?;
     let mut output = private_file(&package.join(CATALOG_FILE))?;
     encrypt_object(
-        &mut Cursor::new(bytes),
+        &mut Cursor::new(&bytes.0),
         &mut output,
         key,
         EncryptedObjectPurpose::BackupManifest,

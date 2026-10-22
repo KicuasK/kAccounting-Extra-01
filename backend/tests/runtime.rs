@@ -62,6 +62,60 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+#[tokio::test]
+async fn startup_recovers_only_recognized_nested_managed_backup_work() {
+    let fixture = Fixture::new();
+    let keys = MemoryKeys::default();
+    let book = fixture.0.join("book");
+    RuntimeBook::init_new(&book, &keys).await.unwrap();
+    let backups = book.join("backups");
+    let generated = backups.join(format!(
+        "{}-{}-{}.managed",
+        "1".repeat(32),
+        "0".repeat(39),
+        "2".repeat(32)
+    ));
+    let unrelated = backups.join("unrelated.managed");
+    for path in [&backups, &generated, &unrelated] {
+        fs::create_dir(path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let token = "0123456789abcdef0123456789abcdef";
+    let name = format!(".kAccounting-Extra-01-encrypted-backup-{token}.work");
+    let recognized = generated.join(&name);
+    let untouched = unrelated.join(&name);
+    for path in [&recognized, &untouched] {
+        fs::create_dir(path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            path.join(".lock"),
+            format!("kAccounting-Extra-01/encrypted-backup-work/v1/{token}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path.join(".lock"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path.join("snapshot.sqlite3"), b"invented interrupted work").unwrap();
+    }
+    let opened = RuntimeBook::open_existing(&book, &keys).await.unwrap();
+    assert!(!recognized.exists());
+    assert!(untouched.join("snapshot.sqlite3").exists());
+    opened.close().await;
+    drop(opened);
+    // An unmarked directory in an owned checkpoint cannot authorize deletion.
+    fs::create_dir(&recognized).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&recognized, fs::Permissions::from_mode(0o700)).unwrap();
+    let database = fs::read(book.join("book.sqlite3")).unwrap();
+    assert!(matches!(
+        RuntimeBook::open_existing(&book, &keys).await,
+        Err(RuntimeError::RecoveryRequired)
+    ));
+    assert!(recognized.exists());
+    assert_eq!(fs::read(book.join("book.sqlite3")).unwrap(), database);
+}
 #[tokio::test]
 async fn explicit_initialization_then_existing_open_never_regenerates_keys() {
     let fixture = Fixture::new();

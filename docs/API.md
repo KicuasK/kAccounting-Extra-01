@@ -1,16 +1,16 @@
 # Backend API
 
-Status: read and explicit localhost write route foundations; not served or deployed.
+Status: private loopback integration preview with explicit accounting and
+book-command write APIs. Version 01 and Tailscale deployment remain incomplete.
 
-The backend constructs a default read-only router and an explicitly enabled
-localhost write router for in-process verification. It
-does not bind a TCP listener, choose a runtime database path, configure
-the approved private runtime, or enable Tailscale. Runtime and Tailscale
-origin/identity integration remain before serving.
+The default constructor remains read-only. The explicit private runtime merges
+accounting and book-command routers with frontend assets, opens an explicitly
+selected book and binds only `127.0.0.1:3000`. It does not initialize a book or
+replace missing keys during startup. See `LOCAL_RUNTIME.md` for commands.
+Tailscale origin/identity integration and deployment acceptance remain pending.
 
-Axum is compiled with default features disabled and only its JSON feature
-enabled. HTTP/1 and HTTP/2 serving support are therefore not enabled by this
-foundation.
+Axum default features remain disabled. JSON, query parsing, HTTP/1 and Tokio integration are
+explicitly enabled; HTTP/2 is disabled.
 
 ## Wire conventions
 
@@ -85,7 +85,8 @@ Drafts are returned separately from posted entries and are ordered by entry
 date then stable entry ID; their lines are ordered by one-based line number.
 Draft responses include `revision`, while posted-entry responses do not expose
 the internal terminal revision. A draft may be empty or unbalanced. These are
-read routes only and do not constitute an approved journal-entry editor.
+read routes only; journal editor interaction is separately approved in
+`VERSION01_DECISIONS.md`, and UI implementation remains pending.
 
 Report ranges are inclusive. Every report route derives from posted journal
 lines and excludes drafts. Trial-balance and income/expense rows are ordered by
@@ -103,7 +104,8 @@ The health route probes its SQLite pool and fails closed with `500` if the
 database connection is unavailable; it does not claim readiness from process
 state alone.
 
-Mutation methods are not registered. `HEAD` is the only non-`GET` method
+The default read-only constructor does not register mutation methods.
+`HEAD` is the only non-`GET` method
 accepted on registered routes; it returns the corresponding `GET` status and
 headers without a response body. Other methods return `405 Method Not Allowed`
 with `Allow: GET, HEAD`. Unknown and near-miss paths return `route_not_found`
@@ -200,8 +202,8 @@ forbidden origins/hosts 403, oversized JSON 413, and missing JSON content type
 415. Errors retain `{code, message}` and never expose SQL details.
 
 Book-owned attachment metadata, verification, draft detach and manual backups
-have the additional localhost routes documented below. Transfer, active-book
-switching and deployment commands remain outside the HTTP API.
+have the additional localhost routes documented below. Transfer orchestration and explicit process-local book selection are documented
+below. Deployment remains an explicit local operation.
 
 ## Book-owned attachment and backup commands
 
@@ -243,8 +245,73 @@ returns the successful checkpoint with a non-null `retention_warning` and null
 failed checkpoint. When retention succeeds it preserves unknown content and
 retains the newest ten authenticated checkpoints belonging to this book.
 
-Streaming attachment upload and plaintext download, backup restore, encrypted
-recipient transfer, and active-book switching are not implemented as HTTP
-commands. Upload must first gain a bounded stream-to-encryption pipeline;
-250 MiB plaintext buffering or plaintext temporary files are not substitutes.
-Existing attachment import remains a local repository operation.
+Streaming binary upload is registered on the entry attachment collection, and
+`GET /api/attachments/{id}/content` provides an authenticated streaming download.
+See [attachment streaming](ATTACHMENT_STREAMING.md) for required metadata,
+draft revisions, posted append, limits, cancellation and error behavior. These
+routes use bounded crypto bridges, not whole-file plaintext buffers or files.
+
+## Explicit book sessions and storage transfer (Round 2)
+
+`serve-chooser <private-book-collection> <frontend-dist>` starts a session without
+opening a book. Selection is never persisted. The existing exact loopback
+Host/Origin and Fetch Metadata protections apply to all routes, including static
+and unknown paths. Session control JSON is limited to 4096 bytes.
+
+| Method and path | Input / behavior |
+| --- | --- |
+| `GET /api/session` | `{book_id, selection_required}`; no paths or key IDs |
+| `GET /api/session/books` | Available direct-child book IDs; discovery does not read keys |
+| `POST /api/session/selection` | `{book_id}`; exact listed direct-child ID only |
+| `DELETE /api/session/selection` | Explicitly clear the current selection |
+
+Accounting/storage access requires explicit selection even with one candidate.
+Active response bodies and owned storage jobs prevent selection changes (409
+`book_busy`); a failed replacement preserves the current book. Shutdown drains
+responses/jobs before closing its book. Import/restore never switch the session.
+
+Storage JSON accepts typed random process-local capabilities registered by a
+trusted local adapter after genuine selection, never paths, keys or overwrite
+instructions. There is deliberately no HTTP capability-registration endpoint.
+The picker/interface is still pending. Capabilities bind existing ancestor
+identities; destination capabilities are consumed on admission. Public recipient
+request content is captured at selection and must be confirmed before export.
+
+| Method and path | Input / result |
+| --- | --- |
+| `POST /api/storage/recipient-requests` | `{destination}`; 202 job |
+| `GET /api/storage/selections/{id}/request` | Public `{request_id, fingerprint}` preview |
+| `POST /api/storage/exports` | `{book, request, destination, confirmed_request_id, confirmed_fingerprint}`; 202 job |
+| `POST /api/storage/imports` | `{package, request, destination}` directory-package capabilities; 202 job |
+| `POST /api/storage/restores` | `{backup, destination}`; 202 job |
+| `POST /api/storage/recoveries` | `{kind:"imports", parent}` or `{kind:"exports", book, parent}`; 202 job |
+| `GET /api/storage/operations/{id}` | Process-local state `running`, `succeeded` or `failed` |
+| `GET /api/storage/operations/{id}/download` | Verified successful export only; encrypted single-file binary download |
+| `POST /api/storage/container-imports?request=CAP&destination=CAP` | `application/octet-stream` encrypted body; 201 verified import result after completion |
+
+Storage commands admit one owned job at a time with no unbounded queue. JSON
+rejects unknown fields, operations survive requester disconnection, and errors
+omit local paths and raw key/SQL failures. Counts and byte sizes are exact decimal
+strings. Completed operation IDs do not survive restart; authenticated persisted
+work determines recovery. The binary import uses bounded 64 KiB bridges, enforces
+transport capacity and any declared Content-Length, then invokes full recipient
+verification. Framing/hash verification alone never authorizes publication.
+New-destination import clears its owned internal encrypted staging only after
+fully verified success; failed/interrupted or uncertain work remains for
+inspection. Original downloaded/external packages remain untouched. Import does
+not select the new book. An incomplete/truncated body must not publish a book; disconnection after the
+complete input has been accepted does not promise cancellation or rollback.
+
+Download responses use `application/octet-stream`, `Cache-Control: no-store`,
+`X-Content-Type-Options: nosniff` and
+`Content-Disposition: attachment; filename="kAccounting-Extra-01.kagextra"`.
+Only producer-captured package descriptors authorize download; arbitrary folder
+registration and replaced export content do not. Safari policy is download to
+Downloads first, followed by manual movement to external media. Browser/UI and
+physical APFS/exFAT acceptance remain separate from HTTP-router tests.
+
+See [storage capability contract](decisions/0043-storage-http-selection-capabilities.md),
+[session contract](decisions/0046-explicit-http-session-runtime.md),
+[container import](decisions/0050-container-import-pipeline.md),
+[local runtime](LOCAL_RUNTIME.md), and
+[round-two audit](RELEASE_AUDIT_R2_2026-10-22.md).

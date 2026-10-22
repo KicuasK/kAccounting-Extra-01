@@ -3,6 +3,52 @@
 Status: active Version 01 completion plan, based on clean Git baseline
 `78d2924`.
 
+Latest 2026-10-22 evening integration: real private HTTPS through the reviewed
+source-built root Tailscale daemon passed the full disposable chooser, write,
+streaming attachment, encrypted backup and container export/import workflow.
+The installed GUI remained sandbox-incompatible at both tested Unix locations;
+do not reuse its failed transport. Temporary test services were stopped and the
+original GUI stayed online. Explicit private/native host start commands,
+shutdown admission protection and GitHub-style exact identity support are wired.
+Permanent provisioning, production signed-app/login/Keychain qualification,
+native operator workflows and Mac Safari acceptance remain separate; this is not
+Version 01 or all non-UI completion. See
+[latest integration checkpoint](PRIVATE_INTEGRATION_2026-10-22.md).
+
+Latest increment: the [30-minute pre-UI session](BUILD_30MIN_2026-10-22.md)
+adds undeployed root-peer Unix runtime ingress, disabled installation-readiness
+plans, sanitized key-access diagnostics and native-selection epoch protection.
+Actual non-root Unix header-forgery refusal passed with zero key operations.
+Real private Tailscale/TLS positive, enabled login/locked-Keychain and complete
+native GUI acceptance are not established; final full-suite evidence is being
+integrated. The approved journal UI remains unimplemented pending remaining
+pre-UI OS gates. External physical APFS/exFAT qualification remains Version 02,
+with all implementations preserved.
+
+Previous execution update: the second 45-minute, twelve-agent non-UI session on
+2026-10-22 adds private-source/portable-ciphertext export staging, selected-path
+identity checks, capability-only storage HTTP jobs, explicit HTTP book sessions,
+single-file encrypted download/import, and cross-module fake-key acceptance.
+Actual OS checks passed for two newly created dedicated Keychain items, retained
+at the user's request; locked/login behavior was not tested. The APFS/exFAT
+disk-image attempt was blocked by the OS, so physical-media acceptance remains
+open. Full-suite/Release results are recorded only after the integrating run.
+See [session evidence](BUILD_12_AGENTS_45MIN_2026-10-22.md) and
+[release audit](RELEASE_AUDIT_R2_2026-10-22.md).
+
+User scope update (2026-10-22): actual external-drive APFS/exFAT acceptance,
+including removal/interruption/recovery, is deferred to Version 02 because no
+external drive is available. Preserve all existing implementations, simulated
+tests and opt-in media tooling. This is no longer a Version 01 or UI-start gate;
+it does not claim physical-media verification has passed.
+
+Before starting the UI phase, finish private HTTPS/Tailscale provenance and
+login/locked-Keychain acceptance; connect
+the trusted local selection adapter to the eventual operator interface. Preserve
+the approved operation policies: choose a book every launch; imports/restores
+leave the current book selected; Safari export downloads to Downloads before the
+user manually moves it to external media. Do not re-ask these decisions.
+
 ## Delivery constraints
 
 - The user delegated security and efficiency engineering decisions on

@@ -11,13 +11,19 @@ use crate::{
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error(transparent)]
+    Package(#[from] crate::recipient_package::RecipientPackageError),
+    #[error(transparent)]
+    Import(#[from] crate::recipient_import::RecipientImportError),
+    #[error(transparent)]
+    Migration(#[from] crate::migration_backup::MigrationBackupError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
@@ -234,4 +240,103 @@ fn check_private_directory(path: &Path) -> Result<(), CommandError> {
         return Err(CommandError::UnsafeDestination);
     }
     Ok(())
+}
+
+/// Parse a bounded public request without following links or accessing keys.
+pub fn read_recipient_request(
+    path: impl AsRef<Path>,
+) -> Result<recipient_transfer::RecipientRequest, CommandError> {
+    let path = path.as_ref();
+    let parent = path.parent().ok_or(CommandError::UnsafeDestination)?;
+    check_private_directory(parent)?;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or(CommandError::UnsafeDestination)?;
+    if parent.starts_with(source) || source.starts_with(parent) {
+        return Err(CommandError::UnsafeDestination);
+    }
+    let mut file = crate::storage::open_regular_file_without_symlink(path)?;
+    #[cfg(unix)]
+    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(CommandError::UnsafeDestination);
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file).take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        return Err(recipient_transfer::RecipientTransferError::InvalidDocument.into());
+    }
+    Ok(recipient_transfer::RecipientRequest::from_json(&bytes)?)
+}
+
+/// Caller must display this immutable request's ID and fingerprint and obtain
+/// explicit source confirmation before invoking export. No request is re-read.
+pub async fn export_recipient_book(
+    source: impl AsRef<Path>,
+    request: &recipient_transfer::RecipientRequest,
+    destination: impl AsRef<Path>,
+    keys: &impl DeviceKeyStore,
+) -> Result<crate::recipient_package::RecipientPackageOutcome, CommandError> {
+    let book = RuntimeBook::open_existing(source, keys).await?;
+    let result = crate::recipient_package::export_recipient_package(
+        book.pool(),
+        book.attachments(),
+        &book.key(),
+        request,
+        destination,
+    )
+    .await
+    .map_err(CommandError::from);
+    book.close().await;
+    result
+}
+
+/// New destination only. Does not select, close or replace an active book.
+pub async fn import_recipient_book(
+    package: impl AsRef<Path>,
+    request: &recipient_transfer::RecipientRequest,
+    destination: impl AsRef<Path>,
+    recipient_keys: &impl RecipientKeyStore,
+    device_keys: &impl DeviceKeyStore,
+) -> Result<crate::recipient_import::RecipientImportOutcome, CommandError> {
+    Ok(crate::recipient_import::import_recipient_package(
+        package,
+        destination,
+        request,
+        recipient_keys,
+        device_keys,
+    )
+    .await?)
+}
+
+pub async fn recover_recipient_exports(
+    source: impl AsRef<Path>,
+    export_parent: impl AsRef<Path>,
+    keys: &impl DeviceKeyStore,
+) -> Result<crate::recipient_package::RecipientExportRecovery, CommandError> {
+    // Export recovery must not depend on a healthy live database. Load the
+    // existing bound key under the book lock without opening/migrating SQLite.
+    let book = crate::runtime::load_recovery_book_key(source, keys)?;
+    crate::recipient_package::recover_interrupted_recipient_exports(export_parent, &book.key())
+        .await
+        .map_err(CommandError::from)
+}
+
+pub async fn restore_pre_migration(
+    source: impl AsRef<Path>,
+    checkpoint: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    keys: &impl DeviceKeyStore,
+) -> Result<LocalBackupOutcome, CommandError> {
+    // Recovery must work even when live SQLite or migration scratch is broken.
+    // This holder validates only the existing binding/key and owns the same
+    // exclusive runtime lock; it never opens or modifies the source database.
+    let book = crate::runtime::load_recovery_book_key(source, keys)?;
+    crate::migration_backup::restore_pre_migration_backup(
+        checkpoint.as_ref(),
+        destination.as_ref(),
+        book.key_id(),
+        &book.key(),
+    )
+    .await
+    .map_err(CommandError::from)
 }

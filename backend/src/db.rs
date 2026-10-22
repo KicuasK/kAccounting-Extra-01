@@ -629,6 +629,49 @@ pub async fn verify_database_snapshot(path: impl AsRef<Path>) -> Result<(), Data
     result
 }
 
+/// Validate an exact recognized migration prefix without mutating the source.
+/// Reconstructing its schema catches removed triggers and unexpected objects
+/// before a later migration could mask the change.
+pub async fn pending_schema_migrations(path: impl AsRef<Path>) -> Result<bool, DatabaseError> {
+    let pool = connect_read_only_database(path.as_ref()).await?;
+    let result = async {
+        verify_migration_target(&pool).await?;
+        let applied: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
+        ).fetch_all(&pool).await.map_err(DatabaseError::Query)?;
+        if applied.is_empty() || applied.len() > MIGRATOR.migrations.len() {
+            return Err(DatabaseError::Integrity("unrecognized migration prefix".into()));
+        }
+        for ((version, success, checksum), expected) in applied.iter().zip(MIGRATOR.migrations.iter()) {
+            if *version != expected.version || *success != 1 || checksum.as_slice() != expected.checksum.as_ref() {
+                return Err(DatabaseError::Integrity("migration prefix checksum or success mismatch".into()));
+            }
+        }
+        if applied.len() == MIGRATOR.migrations.len() { return Ok(false); }
+        let expected = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.map_err(DatabaseError::Connect)?;
+        let prefix = Migrator {
+            migrations: std::borrow::Cow::Owned(MIGRATOR.migrations[..applied.len()].to_vec()),
+            ..Migrator::DEFAULT
+        };
+        let check = async {
+            prefix.run(&expected).await.map_err(DatabaseError::Migrate)?;
+            let sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name";
+            let actual: Vec<(String, String, String, Option<String>)> = sqlx::query_as(sql).fetch_all(&pool).await.map_err(DatabaseError::Query)?;
+            let reference: Vec<(String, String, String, Option<String>)> = sqlx::query_as(sql).fetch_all(&expected).await.map_err(DatabaseError::Query)?;
+            if actual != reference { return Err(DatabaseError::Integrity("legacy schema differs from its migration prefix".into())); }
+            let integrity: String = sqlx::query_scalar("PRAGMA integrity_check").fetch_one(&pool).await.map_err(DatabaseError::Query)?;
+            let foreign: Vec<sqlx::sqlite::SqliteRow> = sqlx::query("PRAGMA foreign_key_check").fetch_all(&pool).await.map_err(DatabaseError::Query)?;
+            if integrity != "ok" || !foreign.is_empty() { return Err(DatabaseError::Integrity("legacy snapshot integrity failed".into())); }
+            Ok(true)
+        }.await;
+        expected.close().await;
+        check
+    }.await;
+    pool.close().await;
+    result
+}
+
 /// Creates a verified, owner-only snapshot without replacing an existing file.
 ///
 /// SQLite writes into a private temporary directory beside the destination.
