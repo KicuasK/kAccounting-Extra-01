@@ -19,6 +19,11 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "_sqlx_migrations"),
     ("table", "accounts"),
     ("index", "accounts_parent_id_idx"),
+    ("index", "accounts_sibling_name_idx"),
+    ("index", "accounts_root_name_idx"),
+    ("trigger", "accounts_protect_active_descendants"),
+    ("trigger", "accounts_validate_active_parent_insert"),
+    ("trigger", "accounts_validate_active_parent_update"),
     ("index", "accounts_element_kind_active_idx"),
     ("trigger", "accounts_require_initial_revision"),
     ("trigger", "accounts_require_next_revision"),
@@ -31,7 +36,15 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "accounts_posting_kind_requires_leaf"),
     ("table", "journal_entries"),
     ("table", "journal_lines"),
+    ("table", "attachments"),
+    ("index", "attachments_entry_id_idx"),
+    ("trigger", "attachments_enforce_book_quota"),
+    ("trigger", "attachments_immutable_update"),
+    ("trigger", "attachments_validate_owner_insert"),
+    ("trigger", "attachments_posted_immutable_delete"),
     ("index", "journal_entries_status_date_idx"),
+    ("index", "journal_entries_one_reversal_idx"),
+    ("index", "journal_entries_correction_target_idx"),
     ("index", "journal_lines_entry_id_idx"),
     ("index", "journal_lines_account_id_idx"),
     ("trigger", "accounts_preserve_journal_classification"),
@@ -43,6 +56,9 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "journal_entries_require_initial_revision"),
     ("trigger", "journal_entries_require_next_draft_revision"),
     ("trigger", "journal_entries_validate_posted_revision"),
+    ("trigger", "journal_entries_preserve_relationship"),
+    ("trigger", "journal_entries_validate_relationship_insert"),
+    ("trigger", "journal_entries_validate_relationship_posting"),
     ("trigger", "journal_lines_insert_only_into_draft"),
     ("trigger", "journal_lines_validate_account_insert"),
     ("trigger", "journal_lines_update_only_in_draft"),
@@ -79,6 +95,10 @@ const REQUIRED_JOURNAL_ENTRY_COLUMNS: &[(&str, &str, i64, i64)] = &[
     ("created_at", "TEXT", 1, 0),
     ("posted_at", "TEXT", 0, 0),
     ("revision", "INTEGER", 1, 0),
+    ("reverses_entry_id", "INTEGER", 0, 0),
+    ("corrects_entry_id", "INTEGER", 0, 0),
+    ("explanation", "TEXT", 0, 0),
+    ("reference", "TEXT", 0, 0),
 ];
 
 const REQUIRED_JOURNAL_LINE_COLUMNS: &[(&str, &str, i64, i64)] = &[
@@ -89,9 +109,109 @@ const REQUIRED_JOURNAL_LINE_COLUMNS: &[(&str, &str, i64, i64)] = &[
     ("side", "TEXT", 1, 0),
     ("amount_minor", "INTEGER", 1, 0),
     ("created_at", "TEXT", 1, 0),
+    ("memo", "TEXT", 0, 0),
 ];
 
 const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
+    (
+        "attachments_validate_owner_insert",
+        &[
+            "BEFORE INSERT",
+            "owner.id = NEW.entry_id",
+            "owner.revision >= 1",
+            "owner.revision >= 2",
+            "owner.posted_at IS NULL",
+            "owner.posted_at IS NOT NULL",
+            "attachment owner must be a valid journal entry",
+        ],
+    ),
+    (
+        "attachments",
+        &[
+            "length(id) = 32",
+            "id NOT GLOB '*[^0-9a-f]*'",
+            "length(display_name) BETWEEN 1 AND 255",
+            "display_name NOT IN ('.', '..')",
+            "instr(display_name, '/') = 0",
+            "instr(display_name, char(92)) = 0",
+            "instr(display_name, char(0)) = 0",
+            "char(127) || '-' || char(159)",
+            "length(plaintext_sha256) = 64",
+            "plaintext_sha256 NOT GLOB '*[^0-9a-f]*'",
+            "byte_length BETWEEN 0 AND 262144000",
+            "length(ciphertext_sha256) = 64",
+            "ciphertext_sha256 NOT GLOB '*[^0-9a-f]*'",
+            "ciphertext_byte_length = byte_length + 72 + 20 * max(1, (byte_length + 65535) / 65536)",
+        ],
+    ),
+    (
+        "attachments_entry_id_idx",
+        &["attachments(entry_id, created_at, id)"],
+    ),
+    (
+        "attachments_enforce_book_quota",
+        &[
+            "BEFORE INSERT",
+            "21474836480",
+            "SUM(byte_length)",
+            "attachment book quota exceeded",
+        ],
+    ),
+    (
+        "attachments_immutable_update",
+        &["BEFORE UPDATE", "attachment metadata is immutable"],
+    ),
+    (
+        "attachments_posted_immutable_delete",
+        &[
+            "BEFORE DELETE",
+            "status = 'posted'",
+            "posted attachment cannot be deleted",
+        ],
+    ),
+    (
+        "accounts_sibling_name_idx",
+        &[
+            "CREATE UNIQUE INDEX",
+            "accounts(parent_id, name)",
+            "WHERE parent_id IS NOT NULL",
+        ],
+    ),
+    (
+        "accounts_root_name_idx",
+        &[
+            "CREATE UNIQUE INDEX",
+            "accounts(name)",
+            "WHERE parent_id IS NULL",
+        ],
+    ),
+    (
+        "accounts_protect_active_descendants",
+        &[
+            "UPDATE OF is_active",
+            "NEW.is_active = 0",
+            "WITH RECURSIVE descendants",
+            "category has active descendants",
+        ],
+    ),
+    (
+        "accounts_validate_active_parent_insert",
+        &[
+            "BEFORE INSERT",
+            "NEW.is_active = 1",
+            "WITH RECURSIVE ancestors",
+            "active account requires active ancestors",
+        ],
+    ),
+    (
+        "accounts_validate_active_parent_update",
+        &[
+            "UPDATE OF parent_id, is_active",
+            "WITH RECURSIVE subtree",
+            "ancestors",
+            "active account requires active ancestors",
+        ],
+    ),
     (
         "accounts",
         &[
@@ -180,7 +300,27 @@ const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
             "status = 'draft' AND posted_at IS NULL",
             "status = 'posted' AND posted_at IS NOT NULL",
             "revision >= 1",
+            "reverses_entry_id INTEGER",
+            "corrects_entry_id INTEGER",
+            "explanation TEXT",
             "created_at TEXT NOT NULL DEFAULT",
+            "reference TEXT CHECK (reference IS NULL OR instr(reference, char(0)) = 0)",
+        ],
+    ),
+    (
+        "journal_entries_one_reversal_idx",
+        &[
+            "CREATE UNIQUE INDEX",
+            "ON journal_entries(reverses_entry_id)",
+            "WHERE reverses_entry_id IS NOT NULL",
+        ],
+    ),
+    (
+        "journal_entries_correction_target_idx",
+        &[
+            "CREATE INDEX",
+            "ON journal_entries(corrects_entry_id, id)",
+            "WHERE corrects_entry_id IS NOT NULL",
         ],
     ),
     (
@@ -193,6 +333,7 @@ const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
             "amount_minor > 0",
             "created_at TEXT NOT NULL DEFAULT",
             "UNIQUE (entry_id, line_no)",
+            "memo TEXT CHECK (memo IS NULL OR instr(memo, char(0)) = 0)",
         ],
     ),
     (
@@ -247,6 +388,7 @@ const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
     (
         "journal_entries_require_next_draft_revision",
         &[
+            "UPDATE OF entry_date, reference, explanation, revision",
             "NEW.revision <> OLD.revision + 1",
             "draft journal entry revision must increase by one",
         ],
@@ -256,6 +398,34 @@ const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
         &[
             "NEW.revision <> OLD.revision + 1",
             "posted journal entry revision is invalid",
+        ],
+    ),
+    (
+        "journal_entries_preserve_relationship",
+        &[
+            "NEW.reverses_entry_id IS NOT OLD.reverses_entry_id",
+            "NEW.corrects_entry_id IS NOT OLD.corrects_entry_id",
+            "OLD.corrects_entry_id IS NOT NULL",
+            "journal entry relationship is immutable",
+            "journal entry explanation contains invalid text",
+        ],
+    ),
+    (
+        "journal_entries_validate_relationship_insert",
+        &[
+            "cannot be both a reversal and a correction",
+            "correcting journal entry requires an explanation",
+            "explanation contains invalid text",
+        ],
+    ),
+    (
+        "journal_entries_validate_relationship_posting",
+        &[
+            "related journal entry must exist and be posted",
+            "a reversal cannot reverse another reversal",
+            "reversal date cannot precede original entry date",
+            "reversal lines must exactly exchange debit and credit sides",
+            "correcting journal entry requires an explanation",
         ],
     ),
     (
@@ -322,6 +492,8 @@ pub enum DatabaseError {
     },
     #[error("failed to apply owner-only database permissions: {0}")]
     Permissions(#[source] std::io::Error),
+    #[error("refusing unsafe SQLite sidecar path: {0}")]
+    UnsafeSidecar(PathBuf),
     #[error("SQLite integrity verification failed: {0}")]
     Integrity(String),
 }
@@ -446,15 +618,7 @@ fn create_private_database_file_if_missing(path: &Path) -> Result<(), DatabaseEr
 /// This is suitable for inspecting a backup or future restore candidate. It
 /// opens read-only, does not enable WAL, and always closes its private pool.
 pub async fn verify_database_snapshot(path: impl AsRef<Path>) -> Result<(), DatabaseError> {
-    let options = SqliteConnectOptions::new()
-        .filename(path.as_ref())
-        .read_only(true)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .map_err(DatabaseError::Connect)?;
+    let pool = connect_read_only_database(path.as_ref()).await?;
 
     let result = async {
         verify_migration_target(&pool).await?;
@@ -521,15 +685,24 @@ fn resolve_backup_completion(
 
 #[cfg(unix)]
 fn harden_database_permissions(path: &Path) -> Result<(), DatabaseError> {
-    let permissions = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, permissions.clone()).map_err(DatabaseError::Permissions)?;
-
+    let mut sidecars = Vec::new();
     for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = sqlite_sidecar_path(path, suffix);
-        if sidecar.exists() {
-            std::fs::set_permissions(sidecar, permissions.clone())
-                .map_err(DatabaseError::Permissions)?;
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => sidecars.push(sidecar),
+            Ok(_) => return Err(DatabaseError::UnsafeSidecar(sidecar)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DatabaseError::Permissions(error)),
         }
+    }
+
+    // Validate every existing sidecar before changing any mode, so a refused
+    // open cannot partially harden the database while leaving an unsafe path.
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, permissions.clone()).map_err(DatabaseError::Permissions)?;
+    for sidecar in sidecars {
+        std::fs::set_permissions(sidecar, permissions.clone())
+            .map_err(DatabaseError::Permissions)?;
     }
 
     Ok(())
@@ -651,28 +824,33 @@ fn cleanup_backup_temporary_path(
 }
 
 async fn preflight_file_database(path: &Path) -> Result<(), DatabaseError> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(false)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .map_err(DatabaseError::Connect)?;
+    let pool = connect_read_only_database(path).await?;
 
     let result = verify_migration_target(&pool).await;
     pool.close().await;
     result
 }
 
-async fn migrate_and_verify(pool: SqlitePool) -> Result<SqlitePool, DatabaseError> {
-    if let Err(error) = verify_migration_target(&pool).await {
-        pool.close().await;
-        return Err(error);
-    }
+/// Opens an existing database without granting SQLite a writable handle.
+///
+/// Besides preventing explicit writes, read-only mode prevents identity
+/// preflight from performing hot-journal recovery on a file that has not yet
+/// been identified as belonging to this application.
+pub(crate) async fn connect_read_only_database(path: &Path) -> Result<SqlitePool, DatabaseError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .foreign_keys(true);
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(DatabaseError::Connect)
+}
 
-    if let Err(error) = claim_empty_database(&pool).await {
+async fn migrate_and_verify(pool: SqlitePool) -> Result<SqlitePool, DatabaseError> {
+    if let Err(error) = verify_and_claim_migration_target(&pool).await {
         pool.close().await;
         return Err(error);
     }
@@ -703,6 +881,13 @@ async fn verify_migration_target(pool: &SqlitePool) -> Result<(), DatabaseError>
             .await
             .map_err(DatabaseError::Query)?;
 
+    validate_migration_target(application_id, schema_object_count)
+}
+
+fn validate_migration_target(
+    application_id: i64,
+    schema_object_count: i64,
+) -> Result<(), DatabaseError> {
     if application_id == APPLICATION_ID || (application_id == 0 && schema_object_count == 0) {
         Ok(())
     } else {
@@ -713,20 +898,53 @@ async fn verify_migration_target(pool: &SqlitePool) -> Result<(), DatabaseError>
     }
 }
 
-async fn claim_empty_database(pool: &SqlitePool) -> Result<(), DatabaseError> {
-    let application_id: i64 = sqlx::query_scalar("PRAGMA application_id")
-        .fetch_one(pool)
+/// Repeats identity validation on the writable pool and claims an empty file.
+///
+/// Keeping the validation and claim in one transaction prevents another
+/// connection from turning an accepted empty file into an unrecognized schema
+/// between those two steps. The earlier read-only preflight remains necessary
+/// so an unrelated file never receives a writable SQLite handle.
+async fn verify_and_claim_migration_target(pool: &SqlitePool) -> Result<(), DatabaseError> {
+    // Reserve the writer slot before reading identity. A deferred transaction
+    // can observe an empty snapshot, lose the migration race, and then fail its
+    // write upgrade with SQLITE_BUSY_SNAPSHOT, which busy_timeout cannot retry.
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(DatabaseError::Query)?;
+    let result = verify_and_claim_migration_target_transaction(&mut transaction).await;
+    match result {
+        Ok(()) => transaction.commit().await.map_err(DatabaseError::Query),
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn verify_and_claim_migration_target_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), DatabaseError> {
+    let application_id: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DatabaseError::Query)?;
+    let schema_object_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(DatabaseError::Query)?;
+
+    validate_migration_target(application_id, schema_object_count)?;
 
     if application_id == 0 {
         sqlx::query(CLAIM_APPLICATION_ID_SQL)
-            .execute(pool)
+            .execute(&mut **transaction)
             .await
             .map_err(DatabaseError::Query)?;
 
         let claimed_id: i64 = sqlx::query_scalar("PRAGMA application_id")
-            .fetch_one(pool)
+            .fetch_one(&mut **transaction)
             .await
             .map_err(DatabaseError::Query)?;
         if claimed_id != APPLICATION_ID {
@@ -907,6 +1125,7 @@ async fn verify_database_integrity_transaction(
     }
 
     verify_journal_schema(transaction).await?;
+    verify_attachment_schema(transaction).await?;
 
     for &(object_type, name) in REQUIRED_SCHEMA_OBJECTS {
         if !matches!(object_type, "index" | "trigger") {
@@ -918,6 +1137,8 @@ async fn verify_database_integrity_transaction(
             "journal_entries"
         } else if name.starts_with("journal_lines_") {
             "journal_lines"
+        } else if name.starts_with("attachments_") {
+            "attachments"
         } else {
             return Err(DatabaseError::Integrity(format!(
                 "required schema object {name} has no owner-table rule"
@@ -962,6 +1183,7 @@ async fn verify_database_integrity_transaction(
         JOIN accounts AS parent ON parent.id = child.parent_id
         WHERE parent.kind <> 'category'
            OR parent.element <> child.element
+           OR (child.is_active = 1 AND parent.is_active = 0)
         LIMIT 1
         "#,
     )
@@ -1003,6 +1225,84 @@ async fn verify_database_integrity_transaction(
     if let Some(account_id) = hierarchy_cycle {
         return Err(DatabaseError::Integrity(format!(
             "account hierarchy cycle detected at account {account_id}"
+        )));
+    }
+
+    let invalid_relationship: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT entry.id
+        FROM journal_entries AS entry
+        LEFT JOIN journal_entries AS related
+          ON related.id = COALESCE(entry.reverses_entry_id, entry.corrects_entry_id)
+        WHERE (entry.reverses_entry_id IS NOT NULL AND entry.corrects_entry_id IS NOT NULL)
+           OR (
+               (entry.reverses_entry_id IS NOT NULL OR entry.corrects_entry_id IS NOT NULL)
+               AND (
+                   entry.status <> 'posted'
+                   OR related.id IS NULL
+                   OR related.status <> 'posted'
+                   OR related.id = entry.id
+               )
+           )
+           OR (
+               entry.corrects_entry_id IS NOT NULL
+               AND (entry.explanation IS NULL OR trim(entry.explanation) = '')
+           )
+           OR (entry.explanation IS NOT NULL AND instr(entry.explanation, char(0)) <> 0)
+           OR (
+               entry.reverses_entry_id IS NOT NULL
+               AND (
+                   related.reverses_entry_id IS NOT NULL
+                   OR entry.entry_date < related.entry_date
+               )
+           )
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DatabaseError::Query)?;
+    if let Some(entry_id) = invalid_relationship {
+        return Err(DatabaseError::Integrity(format!(
+            "journal entry {entry_id} has an invalid reversal or correction relationship"
+        )));
+    }
+
+    let malformed_reversal: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT reversal.id
+        FROM journal_entries AS reversal
+        WHERE reversal.reverses_entry_id IS NOT NULL
+          AND (
+              (SELECT COUNT(*) FROM journal_lines WHERE entry_id = reversal.id)
+                  <> (SELECT COUNT(*) FROM journal_lines WHERE entry_id = reversal.reverses_entry_id)
+              OR EXISTS (
+                  SELECT 1
+                  FROM journal_lines AS reversal_line
+                  LEFT JOIN journal_lines AS original_line
+                    ON original_line.entry_id = reversal.reverses_entry_id
+                   AND original_line.line_no = reversal_line.line_no
+                  WHERE reversal_line.entry_id = reversal.id
+                    AND (
+                        original_line.id IS NULL
+                        OR original_line.account_id <> reversal_line.account_id
+                        OR original_line.amount_minor <> reversal_line.amount_minor
+                        OR original_line.side <> CASE reversal_line.side
+                            WHEN 'debit' THEN 'credit'
+                            ELSE 'debit'
+                        END
+                    )
+              )
+          )
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DatabaseError::Query)?;
+    if let Some(entry_id) = malformed_reversal {
+        return Err(DatabaseError::Integrity(format!(
+            "reversal journal entry {entry_id} does not exactly exchange original sides"
         )));
     }
 
@@ -1065,7 +1365,7 @@ async fn verify_database_integrity_transaction(
 async fn verify_migration_history(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), DatabaseError> {
-    let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+    let applied: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
         r#"
         SELECT version, success, checksum
         FROM _sqlx_migrations
@@ -1091,9 +1391,9 @@ async fn verify_migration_history(
                 expected.version
             )));
         }
-        if !success {
+        if *success != 1 {
             return Err(DatabaseError::Integrity(format!(
-                "migration {version} is not marked successful"
+                "migration {version} has invalid success marker {success}; expected 1"
             )));
         }
         if checksum.as_slice() != expected.checksum.as_ref() {
@@ -1103,6 +1403,63 @@ async fn verify_migration_history(
         }
     }
 
+    Ok(())
+}
+
+async fn verify_attachment_schema(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), DatabaseError> {
+    let strict: Option<i64> = sqlx::query_scalar(
+        "SELECT strict FROM pragma_table_list('attachments') WHERE name = 'attachments'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DatabaseError::Query)?;
+    let columns: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT name, type, \"notnull\", pk FROM pragma_table_info('attachments') ORDER BY cid",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(DatabaseError::Query)?;
+    let expected = [
+        ("id", "TEXT", 1, 1),
+        ("entry_id", "INTEGER", 1, 0),
+        ("display_name", "TEXT", 1, 0),
+        ("plaintext_sha256", "TEXT", 1, 0),
+        ("byte_length", "INTEGER", 1, 0),
+        ("ciphertext_sha256", "TEXT", 1, 0),
+        ("ciphertext_byte_length", "INTEGER", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    ];
+    if strict != Some(1) || !columns_match(&columns, &expected) {
+        return Err(DatabaseError::Integrity(
+            "attachments schema does not match migration 7".to_owned(),
+        ));
+    }
+    let keys: Vec<(String, String, String, String, String)> = sqlx::query_as("SELECT \"table\", \"from\", \"to\", on_update, on_delete FROM pragma_foreign_key_list('attachments')")
+        .fetch_all(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if keys
+        != vec![(
+            "journal_entries".into(),
+            "entry_id".into(),
+            "id".into(),
+            "RESTRICT".into(),
+            "CASCADE".into(),
+        )]
+    {
+        return Err(DatabaseError::Integrity(
+            "attachment owner foreign key does not match migration 7".to_owned(),
+        ));
+    }
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(byte_length), 0) FROM attachments")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DatabaseError::Query)?;
+    if total > crate::attachments::MAX_BOOK_ATTACHMENT_BYTES as i64 {
+        return Err(DatabaseError::Integrity(
+            "attachment book quota exceeded".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1145,6 +1502,14 @@ async fn verify_journal_schema(
             "journal_entries_status_date_idx",
             &["status", "entry_date", "id"][..],
         ),
+        (
+            "journal_entries_one_reversal_idx",
+            &["reverses_entry_id"][..],
+        ),
+        (
+            "journal_entries_correction_target_idx",
+            &["corrects_entry_id", "id"][..],
+        ),
         ("journal_lines_entry_id_idx", &["entry_id", "line_no"][..]),
         (
             "journal_lines_account_id_idx",
@@ -1159,9 +1524,41 @@ async fn verify_journal_schema(
                 .map_err(DatabaseError::Query)?;
         if columns.iter().map(String::as_str).collect::<Vec<_>>() != expected_columns {
             return Err(DatabaseError::Integrity(format!(
-                "{index} columns do not match migration 2"
+                "{index} columns do not match required migrations"
             )));
         }
+    }
+
+    let entry_foreign_keys: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT "table", "from", "to", on_update, on_delete
+        FROM pragma_foreign_key_list('journal_entries')
+        ORDER BY "from"
+        "#,
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(DatabaseError::Query)?;
+    let expected_entry_foreign_keys = [
+        (
+            "journal_entries".to_owned(),
+            "corrects_entry_id".to_owned(),
+            "id".to_owned(),
+            "RESTRICT".to_owned(),
+            "RESTRICT".to_owned(),
+        ),
+        (
+            "journal_entries".to_owned(),
+            "reverses_entry_id".to_owned(),
+            "id".to_owned(),
+            "RESTRICT".to_owned(),
+            "RESTRICT".to_owned(),
+        ),
+    ];
+    if entry_foreign_keys.as_slice() != expected_entry_foreign_keys {
+        return Err(DatabaseError::Integrity(
+            "journal entry relationship foreign keys do not match migration 4".to_owned(),
+        ));
     }
 
     let line_foreign_keys: Vec<(String, String, String, String, String)> = sqlx::query_as(
@@ -1219,8 +1616,9 @@ fn columns_match(
 #[cfg(test)]
 mod tests {
     use super::{
-        APPLICATION_ID, BackupCleanupWarning, CLAIM_APPLICATION_ID_SQL, MIGRATOR,
-        create_private_database_file_if_missing, migrate_and_verify, resolve_backup_completion,
+        APPLICATION_ID, BackupCleanupWarning, CLAIM_APPLICATION_ID_SQL, DatabaseError, MIGRATOR,
+        connect_read_only_database, create_private_database_file_if_missing, migrate_and_verify,
+        open_memory_database, resolve_backup_completion, verify_database_integrity,
     };
 
     #[cfg(unix)]
@@ -1258,6 +1656,61 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn permission_hardening_refuses_sidecar_symlinks_without_touching_their_targets() {
+        use super::{harden_database_permissions, sqlite_sidecar_path};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after Unix epoch")
+            .as_nanos();
+        let database_path = std::env::temp_dir().join(format!(
+            "kAccounting-Extra-01-sidecar-source-{}-{nonce}.sqlite3",
+            std::process::id()
+        ));
+        let target_path = std::env::temp_dir().join(format!(
+            "kAccounting-Extra-01-sidecar-target-{}-{nonce}",
+            std::process::id()
+        ));
+        let sidecar_path = sqlite_sidecar_path(&database_path, "-wal");
+        std::fs::write(&database_path, b"database marker").unwrap();
+        std::fs::write(&target_path, b"unrelated target").unwrap();
+        std::fs::set_permissions(&database_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target_path, &sidecar_path).unwrap();
+
+        let error = harden_database_permissions(&database_path)
+            .expect_err("permission hardening must not follow a sidecar symlink");
+        assert!(matches!(
+            error,
+            DatabaseError::UnsafeSidecar(path) if path == sidecar_path
+        ));
+        assert_eq!(
+            std::fs::metadata(&database_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "all path types must be validated before any permissions change"
+        );
+        assert_eq!(
+            std::fs::metadata(&target_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "sidecar symlink targets must never be chmodded"
+        );
+
+        std::fs::remove_file(sidecar_path).unwrap();
+        std::fs::remove_file(database_path).unwrap();
+        std::fs::remove_file(target_path).unwrap();
+    }
+
     #[test]
     fn static_claim_statement_matches_the_application_id_constant() {
         let claimed_id: i64 = CLAIM_APPLICATION_ID_SQL
@@ -1269,6 +1722,76 @@ mod tests {
             .expect("claim statement should end in a numeric application id");
 
         assert_eq!(claimed_id, APPLICATION_ID);
+    }
+
+    #[tokio::test]
+    async fn read_only_connections_cannot_create_or_replace_database_content() {
+        let path = std::env::temp_dir().join(format!(
+            "kAccounting-Extra-01-read-only-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let writable = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("disposable database should be created");
+        sqlx::query("CREATE TABLE preserved (id INTEGER PRIMARY KEY)")
+            .execute(&writable)
+            .await
+            .expect("test schema should be created");
+        writable.close().await;
+
+        let read_only = connect_read_only_database(&path)
+            .await
+            .expect("existing database should open read-only");
+        sqlx::query("CREATE TABLE forbidden (id INTEGER PRIMARY KEY)")
+            .execute(&read_only)
+            .await
+            .expect_err("read-only verification handles must reject schema writes");
+        let preserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'preserved'",
+        )
+        .fetch_one(&read_only)
+        .await
+        .expect("existing schema should remain readable");
+        let forbidden: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'forbidden'",
+        )
+        .fetch_one(&read_only)
+        .await
+        .expect("schema should remain inspectable after rejected write");
+        assert_eq!((preserved, forbidden), (1, 0));
+        read_only.close().await;
+
+        std::fs::remove_file(path).expect("disposable database should be removed");
+    }
+
+    #[tokio::test]
+    async fn migration_audit_requires_the_exact_success_marker() {
+        let pool = open_memory_database()
+            .await
+            .expect("in-memory database should open");
+        sqlx::query("UPDATE _sqlx_migrations SET success = 2 WHERE version = 1")
+            .execute(&pool)
+            .await
+            .expect("test should inject a non-canonical success marker");
+
+        let error = verify_database_integrity(&pool)
+            .await
+            .expect_err("non-canonical migration success markers must fail closed");
+        assert!(matches!(
+            error,
+            DatabaseError::Integrity(details)
+                if details.contains("migration 1 has invalid success marker 2; expected 1")
+        ));
     }
 
     #[test]
@@ -1315,7 +1838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn third_migration_preserves_existing_version_two_drafts() {
+    async fn later_migrations_preserve_existing_version_two_drafts() {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .in_memory(true)
             .foreign_keys(true);
@@ -1451,13 +1974,15 @@ mod tests {
         .expect("migrated draft should remain readable");
         assert_eq!(stored, ("2026-10-22".to_owned(), 1, 1));
 
-        let posted_state: (String, i64) =
-            sqlx::query_as("SELECT status, revision FROM journal_entries WHERE id = ?")
+        let posted_state: (String, i64, Option<i64>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, revision, reverses_entry_id, corrects_entry_id, explanation FROM journal_entries WHERE id = ?",
+            )
                 .bind(posted_id)
                 .fetch_one(&migrated)
                 .await
                 .expect("legacy posted entry should remain available");
-        assert_eq!(posted_state, ("posted".to_owned(), 1));
+        assert_eq!(posted_state, ("posted".to_owned(), 1, None, None, None));
         let immutable =
             sqlx::query("UPDATE journal_entries SET revision = revision + 1 WHERE id = ?")
                 .bind(posted_id)
@@ -1475,6 +2000,13 @@ mod tests {
                 .fetch_all(&migrated)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(
+            versions,
+            MIGRATOR
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -138,15 +138,17 @@ async fn file_database_uses_safe_pragmas_and_runs_migrations() {
         .get(account.id)
         .await
         .expect("temporary account should persist after reopening");
-    let successful_migration_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (1, 2, 3) AND success = 1",
-    )
-    .fetch_one(&reopened_pool)
-    .await
-    .expect("migration history should be readable");
+    let successful_migration_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(&reopened_pool)
+            .await
+            .expect("migration history should be readable");
 
     assert_eq!(reopened_account.name, "測試資產");
-    assert_eq!(successful_migration_count, 3);
+    assert_eq!(
+        successful_migration_count,
+        sqlx::migrate!("./migrations").iter().count() as i64
+    );
     #[cfg(unix)]
     assert_eq!(
         std::fs::metadata(&database_path)
@@ -188,12 +190,85 @@ async fn file_database_resumes_after_identity_claim_before_first_migration() {
             .fetch_one(&resumed_pool)
             .await
             .expect("resumed migration history should be readable");
-    assert_eq!(migration_count, 3);
+    assert_eq!(
+        migration_count,
+        sqlx::migrate!("./migrations").iter().count() as i64
+    );
     verify_database_integrity(&resumed_pool)
         .await
         .expect("resumed database should pass the complete startup audit");
 
     resumed_pool.close().await;
+    remove_sqlite_files(&database_path);
+}
+
+#[tokio::test]
+async fn concurrent_first_openers_leave_one_reopenable_migrated_database() {
+    let database_path = unique_database_path("concurrent-first-open");
+
+    let (first, second) =
+        tokio::join!(open_database(&database_path), open_database(&database_path),);
+    let mut successful_initializers = Vec::new();
+    let mut initialization_errors = Vec::new();
+    // A losing first opener may currently report a lock or migration race. The
+    // safety contract covered here is that one complete database wins and the
+    // loser cannot leave partial schema that prevents a clean audited reopen.
+    for result in [first, second] {
+        match result {
+            Ok(pool) => successful_initializers.push(pool),
+            Err(error) => initialization_errors.push(error.to_string()),
+        }
+    }
+    assert!(
+        !successful_initializers.is_empty(),
+        "at least one initializer must publish a complete database; errors: {initialization_errors:?}"
+    );
+    assert_eq!(
+        successful_initializers.len() + initialization_errors.len(),
+        2
+    );
+    for pool in successful_initializers {
+        pool.close().await;
+    }
+
+    let reopened_pool = open_database(&database_path)
+        .await
+        .expect("the database should reopen after competing initializers finish");
+    let migration_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(&reopened_pool)
+            .await
+            .expect("the recovered database should have complete migration history");
+    assert_eq!(
+        migration_count,
+        sqlx::migrate!("./migrations").iter().count() as i64
+    );
+    reopened_pool.close().await;
+
+    let (first_reopen, second_reopen) =
+        tokio::join!(open_database(&database_path), open_database(&database_path),);
+    let first_pool = first_reopen.expect("first client should open the initialized database");
+    let second_pool = second_reopen.expect("second client should open the initialized database");
+    let account = AccountRepository::new(first_pool.clone())
+        .create(NewAccount::new(
+            None,
+            "首次並行開啟",
+            AccountingElement::Asset,
+            AccountKind::Posting,
+        ))
+        .await
+        .expect("one opener should be able to write after migration");
+    let reloaded = AccountRepository::new(second_pool.clone())
+        .get(account.id)
+        .await
+        .expect("the other opener should observe the same database");
+    assert_eq!(reloaded, account);
+
+    verify_database_integrity(&first_pool)
+        .await
+        .expect("the recovered database should pass its audit");
+    first_pool.close().await;
+    second_pool.close().await;
     remove_sqlite_files(&database_path);
 }
 
@@ -674,6 +749,41 @@ async fn integrity_verification_rejects_a_same_name_index_on_the_wrong_table() {
             if details.contains("accounts_parent_id_idx")
                 && details.contains("decoy_accounts")
                 && details.contains("expected accounts")));
+}
+
+#[tokio::test]
+async fn integrity_verification_rejects_a_required_trigger_on_the_wrong_table() {
+    let pool = open_memory_database()
+        .await
+        .expect("in-memory database should open");
+
+    sqlx::query("DROP TRIGGER accounts_require_initial_revision")
+        .execute(&pool)
+        .await
+        .expect("test should remove the correctly owned trigger");
+    sqlx::query(
+        r#"
+        CREATE TRIGGER accounts_require_initial_revision
+        BEFORE INSERT ON journal_entries
+        BEGIN
+            SELECT 1;
+        END
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("test should create a same-name trigger on a decoy owner");
+
+    let error = verify_database_integrity(&pool)
+        .await
+        .expect_err("a required trigger attached to the wrong table must fail closed");
+    assert!(matches!(
+        error,
+        DatabaseError::Integrity(details)
+            if details.contains("accounts_require_initial_revision")
+                && details.contains("journal_entries")
+                && details.contains("expected accounts")
+    ));
 }
 
 #[tokio::test]
@@ -1235,6 +1345,71 @@ async fn integrity_verification_rejects_a_preexisting_unbalanced_posted_entry() 
 }
 
 #[tokio::test]
+async fn integrity_verification_rejects_a_posted_entry_with_only_one_line() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = accounts
+        .create(NewAccount::new(
+            None,
+            "現金",
+            AccountingElement::Asset,
+            AccountKind::Posting,
+        ))
+        .await
+        .expect("cash should be created");
+    let draft = journal
+        .create_draft(SaveDraftEntry::new(
+            JournalDate::parse("2026-10-22").unwrap(),
+            vec![JournalLineInput::new(
+                cash.id,
+                JournalSide::Debit,
+                MinorUnits::new(100),
+            )],
+        ))
+        .await
+        .expect("one-line draft should be allowed");
+    let posting_trigger_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'journal_entries_validate_posting'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("posting trigger definition should be readable");
+
+    sqlx::query("DROP TRIGGER journal_entries_validate_posting")
+        .execute(&pool)
+        .await
+        .expect("test should temporarily remove the posting guard");
+    sqlx::query(
+        r#"
+        UPDATE journal_entries
+        SET status = 'posted',
+            posted_at = '2026-10-22T00:00:00.000Z',
+            revision = revision + 1
+        WHERE id = ?
+        "#,
+    )
+    .bind(draft.id.get())
+    .execute(&pool)
+    .await
+    .expect("test should inject a one-line posted entry");
+    sqlx::query(sqlx::AssertSqlSafe(posting_trigger_sql))
+        .execute(&pool)
+        .await
+        .expect("test should restore the exact posting trigger");
+
+    let error = verify_database_integrity(&pool)
+        .await
+        .expect_err("a posted entry with fewer than two lines must fail closed");
+    assert!(matches!(
+        error,
+        DatabaseError::Integrity(details)
+            if details.contains(&draft.id.get().to_string())
+                && details.contains("fewer than two lines")
+    ));
+}
+
+#[tokio::test]
 async fn integrity_verification_rejects_a_same_name_noop_journal_trigger() {
     let pool = open_memory_database().await.expect("database should open");
     sqlx::query("DROP TRIGGER journal_entries_validate_posting")
@@ -1458,6 +1633,52 @@ async fn integrity_verification_rejects_a_retyped_migration_history_table() {
 }
 
 #[tokio::test]
+async fn integrity_verification_observes_consistent_snapshots_during_valid_writes() {
+    let database_path = unique_database_path("audit-concurrent-writes");
+    let pool = open_database(&database_path)
+        .await
+        .expect("file database should open");
+    let repository = AccountRepository::new(pool.clone());
+
+    let writer = async {
+        for sequence in 0..12 {
+            repository
+                .create(NewAccount::new(
+                    None,
+                    format!("並行科目 {sequence}"),
+                    AccountingElement::Asset,
+                    AccountKind::Posting,
+                ))
+                .await
+                .expect("every concurrent account write should remain valid");
+            tokio::task::yield_now().await;
+        }
+    };
+    let auditor = async {
+        for _ in 0..8 {
+            verify_database_integrity(&pool)
+                .await
+                .expect("each audit should observe one internally consistent snapshot");
+            tokio::task::yield_now().await;
+        }
+    };
+
+    tokio::join!(writer, auditor);
+
+    let account_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("final account count should be readable");
+    assert_eq!(account_count, 12);
+    verify_database_integrity(&pool)
+        .await
+        .expect("the final committed state should remain healthy");
+
+    pool.close().await;
+    remove_sqlite_files(&database_path);
+}
+
+#[tokio::test]
 async fn backup_creates_a_verified_owner_only_point_in_time_snapshot() {
     let source_path = unique_database_path("backup-source");
     let backup_path = unique_database_path("verified-backup");
@@ -1600,6 +1821,84 @@ async fn backup_refuses_to_overwrite_an_existing_destination() {
 }
 
 #[tokio::test]
+async fn concurrent_backups_to_one_destination_publish_exactly_one_source() {
+    let first_source_path = unique_database_path("backup-race-source-first");
+    let second_source_path = unique_database_path("backup-race-source-second");
+    let backup_path = unique_database_path("backup-race-destination");
+    let first_pool = open_database(&first_source_path)
+        .await
+        .expect("first source database should open");
+    let second_pool = open_database(&second_source_path)
+        .await
+        .expect("second source database should open");
+
+    AccountRepository::new(first_pool.clone())
+        .create(NewAccount::new(
+            None,
+            "來源甲",
+            AccountingElement::Asset,
+            AccountKind::Posting,
+        ))
+        .await
+        .expect("first source marker should be created");
+    AccountRepository::new(second_pool.clone())
+        .create(NewAccount::new(
+            None,
+            "來源乙",
+            AccountingElement::Asset,
+            AccountKind::Posting,
+        ))
+        .await
+        .expect("second source marker should be created");
+
+    let (first_result, second_result) = tokio::join!(
+        backup_database(&first_pool, &backup_path),
+        backup_database(&second_pool, &backup_path),
+    );
+    let results = [first_result, second_result];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one verified snapshot should be published"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(BackupError::DestinationExists(path)) if path == &backup_path))
+            .count(),
+        1,
+        "the losing publisher must report no-overwrite protection"
+    );
+
+    verify_database_snapshot(&backup_path)
+        .await
+        .expect("the winning snapshot should remain valid");
+    let options = SqliteConnectOptions::new()
+        .filename(&backup_path)
+        .read_only(true);
+    let backup_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("published snapshot should open read-only");
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM accounts ORDER BY id")
+        .fetch_all(&backup_pool)
+        .await
+        .expect("published account marker should be readable");
+    assert!(
+        names == ["來源甲"] || names == ["來源乙"],
+        "the destination must contain one complete source snapshot, never a mixture"
+    );
+
+    backup_pool.close().await;
+    first_pool.close().await;
+    second_pool.close().await;
+    remove_sqlite_files(&first_source_path);
+    remove_sqlite_files(&second_source_path);
+    remove_sqlite_files(&backup_path);
+}
+
+#[tokio::test]
 async fn backup_refuses_a_missing_destination_directory_without_creating_it() {
     let missing_parent = unique_database_path("missing-backup-parent");
     let backup_path = missing_parent.join("backup.sqlite3");
@@ -1709,6 +2008,139 @@ async fn snapshot_verification_refuses_an_unrelated_database_without_modifying_i
     assert!(!candidate_path.with_extension("sqlite3-shm").exists());
 
     std::fs::remove_file(&candidate_path).expect("temporary candidate should be removed");
+}
+
+#[tokio::test]
+async fn snapshot_verification_rejects_schema_tampering_without_modifying_the_candidate() {
+    let source_path = unique_database_path("snapshot-tamper-source");
+    let candidate_path = unique_database_path("snapshot-tamper-candidate");
+    let source_pool = open_database(&source_path)
+        .await
+        .expect("source database should open");
+    backup_database(&source_pool, &candidate_path)
+        .await
+        .expect("candidate snapshot should be created");
+
+    let options = SqliteConnectOptions::new().filename(&candidate_path);
+    let tamper_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("candidate should open for disposable tampering");
+    sqlx::query("DROP TRIGGER journal_lines_delete_only_from_draft")
+        .execute(&tamper_pool)
+        .await
+        .expect("test should remove a required trigger");
+    tamper_pool.close().await;
+
+    let original = std::fs::read(&candidate_path).expect("candidate bytes should be readable");
+    #[cfg(unix)]
+    let original_mode = std::fs::metadata(&candidate_path)
+        .expect("candidate metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    let error = verify_database_snapshot(&candidate_path)
+        .await
+        .expect_err("a tampered snapshot must fail closed");
+
+    assert!(matches!(
+        error,
+        DatabaseError::Integrity(details)
+            if details.contains("required schema object is missing")
+                && details.contains("journal_lines_delete_only_from_draft")
+    ));
+    assert_eq!(
+        std::fs::read(&candidate_path).expect("candidate should remain readable"),
+        original,
+        "read-only verification must not rewrite a rejected candidate"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&candidate_path)
+            .expect("candidate metadata should remain readable")
+            .permissions()
+            .mode()
+            & 0o777,
+        original_mode,
+        "snapshot verification must not change candidate permissions"
+    );
+    assert!(!candidate_path.with_extension("sqlite3-wal").exists());
+    assert!(!candidate_path.with_extension("sqlite3-shm").exists());
+
+    source_pool.close().await;
+    remove_sqlite_files(&source_path);
+    remove_sqlite_files(&candidate_path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_snapshot_verification_is_read_only_for_a_healthy_candidate() {
+    let source_path = unique_database_path("snapshot-read-only-source");
+    let candidate_path = unique_database_path("snapshot-read-only-candidate");
+    let source_pool = open_database(&source_path)
+        .await
+        .expect("source database should open");
+    AccountRepository::new(source_pool.clone())
+        .create(NewAccount::new(
+            None,
+            "唯讀驗證科目",
+            AccountingElement::Asset,
+            AccountKind::Posting,
+        ))
+        .await
+        .expect("source marker should be created");
+    backup_database(&source_pool, &candidate_path)
+        .await
+        .expect("healthy candidate should be created");
+    std::fs::set_permissions(&candidate_path, std::fs::Permissions::from_mode(0o640))
+        .expect("test should set a recognizable candidate mode");
+    let original = std::fs::read(&candidate_path).expect("candidate bytes should be readable");
+
+    let (first, second, third) = tokio::join!(
+        verify_database_snapshot(&candidate_path),
+        verify_database_snapshot(&candidate_path),
+        verify_database_snapshot(&candidate_path),
+    );
+    first.expect("first concurrent verification should succeed");
+    second.expect("second concurrent verification should succeed");
+    third.expect("third concurrent verification should succeed");
+
+    assert_eq!(
+        std::fs::read(&candidate_path).expect("candidate should remain readable"),
+        original,
+        "successful snapshot verification must not rewrite the candidate"
+    );
+    assert_eq!(
+        std::fs::metadata(&candidate_path)
+            .expect("candidate metadata should remain readable")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640,
+        "snapshot verification must not harden or otherwise change permissions"
+    );
+    assert!(!candidate_path.with_extension("sqlite3-wal").exists());
+    assert!(!candidate_path.with_extension("sqlite3-shm").exists());
+
+    source_pool.close().await;
+    remove_sqlite_files(&source_path);
+    remove_sqlite_files(&candidate_path);
+}
+
+#[tokio::test]
+async fn snapshot_verification_refuses_a_missing_path_without_creating_it() {
+    let candidate_path = unique_database_path("missing-snapshot-candidate");
+
+    let error = verify_database_snapshot(&candidate_path)
+        .await
+        .expect_err("a missing snapshot path must not be created as an empty database");
+
+    assert!(matches!(error, DatabaseError::Connect(_)));
+    assert!(!candidate_path.exists());
+    assert!(!candidate_path.with_extension("sqlite3-wal").exists());
+    assert!(!candidate_path.with_extension("sqlite3-shm").exists());
 }
 
 fn unique_database_path(label: &str) -> std::path::PathBuf {

@@ -59,6 +59,9 @@ pub struct GeneralLedgerLine {
     pub amount: MinorUnits,
     pub debit_balance: MinorUnits,
     pub credit_balance: MinorUnits,
+    pub memo: Option<String>,
+    pub reference: Option<String>,
+    pub explanation: Option<String>,
 }
 
 /// Chronological posted-line ledger for one permanent account identifier.
@@ -102,6 +105,7 @@ pub struct GeneralJournalLine {
     pub account_name: String,
     pub side: JournalSide,
     pub amount: MinorUnits,
+    pub memo: Option<String>,
 }
 
 /// One balanced posted entry in chronological general-journal order.
@@ -113,6 +117,8 @@ pub struct GeneralJournalEntry {
     pub lines: Vec<GeneralJournalLine>,
     pub debit_total: MinorUnits,
     pub credit_total: MinorUnits,
+    pub reference: Option<String>,
+    pub explanation: Option<String>,
 }
 
 /// Posted general journal for one inclusive accounting-date range.
@@ -148,13 +154,37 @@ pub struct IncomeExpenseReport {
     pub net_result: MinorUnits,
 }
 
+/// One posting account, signed in its accounting element's natural direction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BalanceSheetRow {
+    pub account_id: AccountId,
+    pub account_name: String,
+    pub element: AccountingElement,
+    pub balance: MinorUnits,
+}
+
+/// Posted-lines-only statement with the explicit hierarchy and unclosed result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BalanceSheet {
+    pub as_of: JournalDate,
+    pub hierarchy: Vec<super::accounts::Account>,
+    pub rows: Vec<BalanceSheetRow>,
+    pub total_assets: MinorUnits,
+    pub total_liabilities: MinorUnits,
+    pub total_equity: MinorUnits,
+    pub unclosed_net_result: MinorUnits,
+    pub total_liabilities_and_equity: MinorUnits,
+}
+
 #[derive(Debug, Error)]
 pub enum ReportError {
+    #[error("stored account hierarchy is invalid: {0}")]
+    InvalidAccountHierarchy(String),
     #[error("account {0} was not found for reporting")]
     AccountNotFound(i64),
-    #[error("trial-balance arithmetic overflowed for account {0}")]
+    #[error("report arithmetic overflowed for account {0}")]
     AccountOverflow(i64),
-    #[error("trial-balance total arithmetic overflowed")]
+    #[error("report total arithmetic overflowed")]
     TotalOverflow,
     #[error("five-element summary arithmetic overflowed for {0}")]
     ElementOverflow(AccountingElement),
@@ -164,6 +194,8 @@ pub enum ReportError {
     InvalidDateRange { from: String, through: String },
     #[error("stored journal line has invalid side {0}")]
     InvalidSide(String),
+    #[error("stored journal line {line_id} has non-positive amount {amount}")]
+    InvalidAmount { line_id: i64, amount: i64 },
     #[error("stored account has invalid element {0}")]
     InvalidElement(String),
     #[error("stored journal entry has invalid date {0}")]
@@ -198,89 +230,71 @@ impl ReportRepository {
     /// Draft entries are excluded in SQL. Account balances are never read from
     /// or written to a mutable balance column.
     pub async fn trial_balance(&self, as_of: JournalDate) -> Result<TrialBalance, ReportError> {
-        let lines: Vec<ReportLineRow> = sqlx::query_as(
-            r#"
-            SELECT account.id AS account_id,
-                   account.name AS account_name,
-                   account.element,
-                   line.side,
-                   line.amount_minor
-            FROM journal_lines AS line
-            JOIN journal_entries AS entry ON entry.id = line.entry_id
-            JOIN accounts AS account ON account.id = line.account_id
-            WHERE entry.status = 'posted'
-              AND entry.entry_date <= ?
-            ORDER BY account.id, line.id
-            "#,
-        )
-        .bind(as_of.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(ReportError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(ReportError::Database)?;
+        let lines = load_trial_balance_lines(&mut transaction, &as_of).await?;
+        let report = build_trial_balance(as_of, lines)?;
+        transaction.commit().await.map_err(ReportError::Database)?;
+        Ok(report)
+    }
 
-        let mut accumulators: BTreeMap<AccountId, TrialBalanceAccumulator> = BTreeMap::new();
-        for line in lines {
-            let account_id = AccountId::new(line.account_id);
-            let element = AccountingElement::try_from(line.element.as_str())
-                .map_err(|_| ReportError::InvalidElement(line.element.clone()))?;
-            let side = match line.side.as_str() {
-                "debit" => JournalSide::Debit,
-                "credit" => JournalSide::Credit,
-                _ => return Err(ReportError::InvalidSide(line.side)),
+    /// Derives an as-of statement without closing entries or inferred current/non-current labels.
+    /// All hierarchy metadata and posted amounts come from the same SQLite snapshot.
+    pub async fn balance_sheet(&self, as_of: JournalDate) -> Result<BalanceSheet, ReportError> {
+        let mut transaction = self.pool.begin().await.map_err(ReportError::Database)?;
+        let lines = load_trial_balance_lines(&mut transaction, &as_of).await?;
+        let trial = build_trial_balance(as_of.clone(), lines)?;
+        let hierarchy = super::accounts::list_accounts_in_transaction(&mut transaction)
+            .await
+            .map_err(|e| ReportError::InvalidAccountHierarchy(e.to_string()))?;
+        let mut pending = super::accounts::build_account_tree(&hierarchy)
+            .map_err(|e| ReportError::InvalidAccountHierarchy(e.to_string()))?;
+        // Validate the complete tree, then drop it without recursive stack use.
+        while let Some(node) = pending.pop() {
+            pending.extend(node.children);
+        }
+        transaction.commit().await.map_err(ReportError::Database)?;
+        let mut totals = [0_i128; 5];
+        let mut rows = Vec::new();
+        for row in trial.rows {
+            let natural_balance = match row.element {
+                AccountingElement::Asset | AccountingElement::Expense => {
+                    i128::from(row.debit_balance.get()) - i128::from(row.credit_balance.get())
+                }
+                _ => i128::from(row.credit_balance.get()) - i128::from(row.debit_balance.get()),
             };
-            let accumulator =
-                accumulators
-                    .entry(account_id)
-                    .or_insert_with(|| TrialBalanceAccumulator {
-                        account_name: line.account_name,
-                        element,
-                        debit: MinorUnits::ZERO,
-                        credit: MinorUnits::ZERO,
-                    });
-            let total = match side {
-                JournalSide::Debit => &mut accumulator.debit,
-                JournalSide::Credit => &mut accumulator.credit,
-            };
-            *total = total
-                .checked_add(MinorUnits::new(line.amount_minor))
-                .map_err(|MoneyError::Overflow| ReportError::AccountOverflow(account_id.get()))?;
+            totals[element_index(row.element)] += natural_balance;
+            if matches!(
+                row.element,
+                AccountingElement::Asset | AccountingElement::Liability | AccountingElement::Equity
+            ) {
+                rows.push(BalanceSheetRow {
+                    account_id: row.account_id,
+                    account_name: row.account_name,
+                    element: row.element,
+                    balance: minor_units_from_report_total(natural_balance)?,
+                });
+            }
         }
-
-        let mut rows = Vec::with_capacity(accumulators.len());
-        let mut total_debit = MinorUnits::ZERO;
-        let mut total_credit = MinorUnits::ZERO;
-        for (account_id, accumulator) in accumulators {
-            let (debit_balance, credit_balance) =
-                net_balance(accumulator.debit, accumulator.credit, account_id)?;
-            total_debit = total_debit
-                .checked_add(debit_balance)
-                .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)?;
-            total_credit = total_credit
-                .checked_add(credit_balance)
-                .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)?;
-            rows.push(TrialBalanceRow {
-                account_id,
-                account_name: accumulator.account_name,
-                element: accumulator.element,
-                debit_turnover: accumulator.debit,
-                credit_turnover: accumulator.credit,
-                debit_balance,
-                credit_balance,
-            });
+        let net_result = totals[element_index(AccountingElement::Income)]
+            - totals[element_index(AccountingElement::Expense)];
+        let total_assets = totals[element_index(AccountingElement::Asset)];
+        let total_liabilities = totals[element_index(AccountingElement::Liability)];
+        let total_equity = totals[element_index(AccountingElement::Equity)];
+        let liabilities_and_equity = total_liabilities + total_equity + net_result;
+        if total_assets != liabilities_and_equity {
+            return Err(ReportError::InvalidStoredJournal(
+                "balance sheet does not reconcile".to_owned(),
+            ));
         }
-
-        if total_debit != total_credit {
-            return Err(ReportError::DoesNotReconcile {
-                debit: total_debit.get(),
-                credit: total_credit.get(),
-            });
-        }
-
-        Ok(TrialBalance {
+        Ok(BalanceSheet {
             as_of,
+            hierarchy,
             rows,
-            total_debit,
-            total_credit,
+            total_assets: minor_units_from_report_total(total_assets)?,
+            total_liabilities: minor_units_from_report_total(total_liabilities)?,
+            total_equity: minor_units_from_report_total(total_equity)?,
+            unclosed_net_result: minor_units_from_report_total(net_result)?,
+            total_liabilities_and_equity: minor_units_from_report_total(liabilities_and_equity)?,
         })
     }
 
@@ -373,9 +387,12 @@ impl ReportRepository {
                    entry.entry_date,
                    line.line_no,
                    line.side,
-                   line.amount_minor
-            FROM journal_lines AS line
-            JOIN journal_entries AS entry ON entry.id = line.entry_id
+                   line.amount_minor,
+                   line.memo, entry.reference, entry.explanation
+            -- Preserve a line-first loop so a single-account ledger does not
+            -- scan every posted entry and all of its unrelated lines.
+            FROM journal_lines AS line INDEXED BY journal_lines_account_id_idx
+            CROSS JOIN journal_entries AS entry ON entry.id = line.entry_id
             WHERE line.account_id = ?
               AND entry.status = 'posted'
               AND entry.entry_date <= ?
@@ -394,7 +411,7 @@ impl ReportRepository {
         let mut credit_turnover = MinorUnits::ZERO;
         for stored in stored_lines {
             let side = parse_side(stored.side)?;
-            let amount = MinorUnits::new(stored.amount_minor);
+            let amount = parse_amount(stored.line_id, stored.amount_minor)?;
             let total = match side {
                 JournalSide::Debit => &mut debit_turnover,
                 JournalSide::Credit => &mut credit_turnover,
@@ -404,8 +421,7 @@ impl ReportRepository {
                 .map_err(|MoneyError::Overflow| ReportError::AccountOverflow(account_id.get()))?;
             let (debit_balance, credit_balance) =
                 net_balance(debit_turnover, credit_turnover, account_id)?;
-            let entry_date = JournalDate::parse(&stored.entry_date)
-                .map_err(|_| ReportError::InvalidStoredDate(stored.entry_date))?;
+            let entry_date = parse_stored_date(stored.entry_date)?;
             lines.push(GeneralLedgerLine {
                 entry_id: JournalEntryId::new(stored.entry_id),
                 line_id: JournalLineId::new(stored.line_id),
@@ -415,6 +431,9 @@ impl ReportRepository {
                 amount,
                 debit_balance,
                 credit_balance,
+                memo: stored.memo,
+                reference: stored.reference,
+                explanation: stored.explanation,
             });
         }
         let (debit_balance, credit_balance) =
@@ -460,9 +479,12 @@ impl ReportRepository {
                    entry.entry_date,
                    line.line_no,
                    line.side,
-                   line.amount_minor
-            FROM journal_lines AS line
-            JOIN journal_entries AS entry ON entry.id = line.entry_id
+                   line.amount_minor,
+                   line.memo, entry.reference, entry.explanation
+            -- Preserve a line-first loop so opening-history reads remain
+            -- proportional to this account's activity.
+            FROM journal_lines AS line INDEXED BY journal_lines_account_id_idx
+            CROSS JOIN journal_entries AS entry ON entry.id = line.entry_id
             WHERE line.account_id = ?
               AND entry.status = 'posted'
               AND entry.entry_date <= ?
@@ -484,10 +506,9 @@ impl ReportRepository {
         let mut opening_turnover = (MinorUnits::ZERO, MinorUnits::ZERO);
 
         for stored in stored_lines {
-            let entry_date = JournalDate::parse(&stored.entry_date)
-                .map_err(|_| ReportError::InvalidStoredDate(stored.entry_date.clone()))?;
+            let entry_date = parse_stored_date(stored.entry_date)?;
             let side = parse_side(stored.side)?;
-            let amount = MinorUnits::new(stored.amount_minor);
+            let amount = parse_amount(stored.line_id, stored.amount_minor)?;
             let cumulative = match side {
                 JournalSide::Debit => &mut cumulative_debit,
                 JournalSide::Credit => &mut cumulative_credit,
@@ -519,6 +540,9 @@ impl ReportRepository {
                 amount,
                 debit_balance,
                 credit_balance,
+                memo: stored.memo,
+                reference: stored.reference,
+                explanation: stored.explanation,
             });
         }
 
@@ -555,12 +579,15 @@ impl ReportRepository {
             SELECT entry.id AS entry_id,
                    entry.entry_date,
                    entry.posted_at,
+                   entry.reference,
+                   entry.explanation,
                    line.id AS line_id,
                    line.line_no,
                    account.id AS account_id,
                    account.name AS account_name,
                    line.side,
-                   line.amount_minor
+                   line.amount_minor,
+                   line.memo
             FROM journal_entries AS entry
             JOIN journal_lines AS line ON line.entry_id = entry.id
             JOIN accounts AS account ON account.id = line.account_id
@@ -592,12 +619,13 @@ impl ReportRepository {
             }
 
             if current.is_none() {
-                let entry_date = JournalDate::parse(&stored.entry_date)
-                    .map_err(|_| ReportError::InvalidStoredDate(stored.entry_date.clone()))?;
+                let entry_date = parse_stored_date(stored.entry_date.clone())?;
                 current = Some(GeneralJournalAccumulator {
                     id: JournalEntryId::new(stored.entry_id),
                     entry_date,
                     posted_at: stored.posted_at.clone(),
+                    reference: stored.reference.clone(),
+                    explanation: stored.explanation.clone(),
                     lines: Vec::new(),
                     debit_total: MinorUnits::ZERO,
                     credit_total: MinorUnits::ZERO,
@@ -610,7 +638,7 @@ impl ReportRepository {
                 )
             })?;
             let side = parse_side(stored.side)?;
-            let amount = MinorUnits::new(stored.amount_minor);
+            let amount = parse_amount(stored.line_id, stored.amount_minor)?;
             let total = match side {
                 JournalSide::Debit => &mut entry.debit_total,
                 JournalSide::Credit => &mut entry.credit_total,
@@ -625,6 +653,7 @@ impl ReportRepository {
                 account_name: stored.account_name,
                 side,
                 amount,
+                memo: stored.memo,
             });
         }
         if let Some(entry) = current {
@@ -673,6 +702,8 @@ impl ReportRepository {
             SELECT account.id AS account_id,
                    account.name AS account_name,
                    account.element,
+                   entry.entry_date,
+                   line.id AS line_id,
                    line.side,
                    line.amount_minor
             FROM journal_lines AS line
@@ -682,7 +713,6 @@ impl ReportRepository {
               AND entry.entry_date >= ?
               AND entry.entry_date <= ?
               AND account.element IN ('income', 'expense')
-            ORDER BY account.id, line.id
             "#,
         )
         .bind(from.as_str())
@@ -693,6 +723,7 @@ impl ReportRepository {
 
         let mut accumulators: BTreeMap<AccountId, TrialBalanceAccumulator> = BTreeMap::new();
         for line in lines {
+            parse_stored_date(line.entry_date)?;
             let account_id = AccountId::new(line.account_id);
             let element = AccountingElement::try_from(line.element.as_str())
                 .map_err(|_| ReportError::InvalidElement(line.element.clone()))?;
@@ -712,18 +743,22 @@ impl ReportRepository {
                         debit: MinorUnits::ZERO,
                         credit: MinorUnits::ZERO,
                     });
+            let amount = parse_amount(line.line_id, line.amount_minor)?;
             let total = match side {
                 JournalSide::Debit => &mut accumulator.debit,
                 JournalSide::Credit => &mut accumulator.credit,
             };
             *total = total
-                .checked_add(MinorUnits::new(line.amount_minor))
+                .checked_add(amount)
                 .map_err(|MoneyError::Overflow| ReportError::AccountOverflow(account_id.get()))?;
         }
 
         let mut rows = Vec::with_capacity(accumulators.len());
-        let mut total_income = MinorUnits::ZERO;
-        let mut total_expense = MinorUnits::ZERO;
+        // Net activity can be negative because opposite-side adjustments are
+        // retained. Accumulate in a wider exact type so an in-range final
+        // total cannot fail merely because of account identifier order.
+        let mut total_income = 0_i128;
+        let mut total_expense = 0_i128;
         for (account_id, accumulator) in accumulators {
             let (net_activity, report_total) = match accumulator.element {
                 AccountingElement::Income => (
@@ -745,8 +780,8 @@ impl ReportRepository {
                 }
             };
             *report_total = report_total
-                .checked_add(net_activity)
-                .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)?;
+                .checked_add(i128::from(net_activity.get()))
+                .ok_or(ReportError::TotalOverflow)?;
             rows.push(IncomeExpenseRow {
                 account_id,
                 account_name: accumulator.account_name,
@@ -757,6 +792,8 @@ impl ReportRepository {
             });
         }
 
+        let total_income = minor_units_from_report_total(total_income)?;
+        let total_expense = minor_units_from_report_total(total_expense)?;
         let net_result = total_income
             .checked_sub(total_expense)
             .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)?;
@@ -772,11 +809,109 @@ impl ReportRepository {
     }
 }
 
+async fn load_trial_balance_lines(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    as_of: &JournalDate,
+) -> Result<Vec<ReportLineRow>, ReportError> {
+    let lines: Vec<ReportLineRow> = sqlx::query_as(
+        r#"
+            SELECT account.id AS account_id,
+                   account.name AS account_name,
+                   account.element,
+                   entry.entry_date,
+                   line.id AS line_id,
+                   line.side,
+                   line.amount_minor
+            FROM journal_lines AS line
+            JOIN journal_entries AS entry ON entry.id = line.entry_id
+            JOIN accounts AS account ON account.id = line.account_id
+            WHERE entry.status = 'posted'
+              AND entry.entry_date <= ?
+            "#,
+    )
+    .bind(as_of.as_str())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(ReportError::Database)?;
+
+    Ok(lines)
+}
+
+fn build_trial_balance(
+    as_of: JournalDate,
+    lines: Vec<ReportLineRow>,
+) -> Result<TrialBalance, ReportError> {
+    let mut accumulators: BTreeMap<AccountId, TrialBalanceAccumulator> = BTreeMap::new();
+    for line in lines {
+        parse_stored_date(line.entry_date)?;
+        let account_id = AccountId::new(line.account_id);
+        let element = AccountingElement::try_from(line.element.as_str())
+            .map_err(|_| ReportError::InvalidElement(line.element.clone()))?;
+        let side = parse_side(line.side)?;
+        let accumulator =
+            accumulators
+                .entry(account_id)
+                .or_insert_with(|| TrialBalanceAccumulator {
+                    account_name: line.account_name,
+                    element,
+                    debit: MinorUnits::ZERO,
+                    credit: MinorUnits::ZERO,
+                });
+        let amount = parse_amount(line.line_id, line.amount_minor)?;
+        let total = match side {
+            JournalSide::Debit => &mut accumulator.debit,
+            JournalSide::Credit => &mut accumulator.credit,
+        };
+        *total = total
+            .checked_add(amount)
+            .map_err(|MoneyError::Overflow| ReportError::AccountOverflow(account_id.get()))?;
+    }
+
+    let mut rows = Vec::with_capacity(accumulators.len());
+    let mut total_debit = MinorUnits::ZERO;
+    let mut total_credit = MinorUnits::ZERO;
+    for (account_id, accumulator) in accumulators {
+        let (debit_balance, credit_balance) =
+            net_balance(accumulator.debit, accumulator.credit, account_id)?;
+        total_debit = total_debit
+            .checked_add(debit_balance)
+            .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)?;
+        total_credit = total_credit
+            .checked_add(credit_balance)
+            .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)?;
+        rows.push(TrialBalanceRow {
+            account_id,
+            account_name: accumulator.account_name,
+            element: accumulator.element,
+            debit_turnover: accumulator.debit,
+            credit_turnover: accumulator.credit,
+            debit_balance,
+            credit_balance,
+        });
+    }
+
+    if total_debit != total_credit {
+        return Err(ReportError::DoesNotReconcile {
+            debit: total_debit.get(),
+            credit: total_credit.get(),
+        });
+    }
+
+    Ok(TrialBalance {
+        as_of,
+        rows,
+        total_debit,
+        total_credit,
+    })
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct ReportLineRow {
     account_id: i64,
     account_name: String,
     element: String,
+    entry_date: String,
+    line_id: i64,
     side: String,
     amount_minor: i64,
 }
@@ -789,6 +924,9 @@ struct LedgerLineRow {
     line_no: i64,
     side: String,
     amount_minor: i64,
+    memo: Option<String>,
+    reference: Option<String>,
+    explanation: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -802,6 +940,9 @@ struct GeneralJournalLineRow {
     account_name: String,
     side: String,
     amount_minor: i64,
+    memo: Option<String>,
+    reference: Option<String>,
+    explanation: Option<String>,
 }
 
 struct TrialBalanceAccumulator {
@@ -818,6 +959,8 @@ struct GeneralJournalAccumulator {
     lines: Vec<GeneralJournalLine>,
     debit_total: MinorUnits,
     credit_total: MinorUnits,
+    reference: Option<String>,
+    explanation: Option<String>,
 }
 
 fn parse_side(side: String) -> Result<JournalSide, ReportError> {
@@ -825,6 +968,21 @@ fn parse_side(side: String) -> Result<JournalSide, ReportError> {
         "debit" => Ok(JournalSide::Debit),
         "credit" => Ok(JournalSide::Credit),
         _ => Err(ReportError::InvalidSide(side)),
+    }
+}
+
+fn parse_amount(line_id: i64, amount: i64) -> Result<MinorUnits, ReportError> {
+    if amount <= 0 {
+        Err(ReportError::InvalidAmount { line_id, amount })
+    } else {
+        Ok(MinorUnits::new(amount))
+    }
+}
+
+fn parse_stored_date(date: String) -> Result<JournalDate, ReportError> {
+    match JournalDate::parse(&date) {
+        Ok(date) => Ok(date),
+        Err(_) => Err(ReportError::InvalidStoredDate(date)),
     }
 }
 
@@ -865,6 +1023,8 @@ fn finish_general_journal_entry(
         id: entry.id,
         entry_date: entry.entry_date,
         posted_at: entry.posted_at,
+        reference: entry.reference,
+        explanation: entry.explanation,
         lines: entry.lines,
         debit_total: entry.debit_total,
         credit_total: entry.credit_total,
@@ -901,4 +1061,56 @@ fn checked_element_total(
             .checked_add(value(row))
             .map_err(|MoneyError::Overflow| ReportError::TotalOverflow)
     })
+}
+
+fn minor_units_from_report_total(total: i128) -> Result<MinorUnits, ReportError> {
+    i64::try_from(total)
+        .map(MinorUnits::new)
+        .map_err(|_| ReportError::TotalOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        JournalDate, MinorUnits, ReportError, minor_units_from_report_total, parse_stored_date,
+    };
+
+    #[test]
+    fn stored_report_dates_use_journal_calendar_validation() {
+        for date in ["0001-01-01", "2024-02-29", "9999-12-31"] {
+            assert_eq!(
+                parse_stored_date(date.to_owned()).expect("valid boundary date should parse"),
+                JournalDate::parse(date).unwrap()
+            );
+        }
+
+        for date in ["0000-01-01", "2026-02-29", "2026-04-31"] {
+            assert!(matches!(
+                parse_stored_date(date.to_owned()),
+                Err(ReportError::InvalidStoredDate(stored)) if stored == date
+            ));
+        }
+    }
+
+    #[test]
+    fn signed_report_totals_are_narrowed_only_after_exact_accumulation() {
+        let maximum = i128::from(i64::MAX);
+        let in_range_after_cancellation = maximum
+            .checked_add(maximum)
+            .and_then(|total| total.checked_sub(maximum))
+            .unwrap();
+
+        assert_eq!(
+            minor_units_from_report_total(in_range_after_cancellation).unwrap(),
+            MinorUnits::new(i64::MAX)
+        );
+        assert!(matches!(
+            minor_units_from_report_total(maximum + 1),
+            Err(ReportError::TotalOverflow)
+        ));
+        assert!(matches!(
+            minor_units_from_report_total(i128::from(i64::MIN) - 1),
+            Err(ReportError::TotalOverflow)
+        ));
+    }
 }

@@ -15,7 +15,8 @@ Status: draft
 - Only Chinese characters inside account names use `DFKai-SB`, with a safe serif-style fallback if unavailable.
 - English letters, numbers, punctuation, dates, and monetary amounts remain in `system-ui`, including within mixed-language account names.
 - Amount columns use tabular numerals and right alignment.
-- Font fallback and mixed-script rendering must be verified in Mac Safari and iPad Safari.
+- Font fallback and mixed-script rendering must be verified in Mac Safari for
+  Version 01 and in iPad Safari when the Version 02 interface is implemented.
 
 ## General Journal entry direction
 
@@ -39,12 +40,20 @@ Illustrative structure:
           （十月份薪資入帳）
 ```
 
-This reference defines information hierarchy and visual character, not the complete editing interaction. Field navigation, account search, validation messages, drafts, line insertion, touch behavior, and correction flows still require a dedicated design review before implementation.
+The Version 01 editing interaction was approved on 2026-10-22. Its header
+contains accounting date, optional editable reference, and optional
+whole-entry explanation. Each line contains account, separate debit and credit
+amount columns, and an optional line memo. Drafts use an explicit Save action;
+Version 01 does not add timed autosave or implicit crash recovery. Account
+lookup supports keyboard search by account name and ancestor path. Validation,
+line insertion, posting, reversal, and correction must preserve the structure
+and accounting rules above.
 
 ## Responsive behavior
 
 - Mac: persistent sidebar where space permits, keyboard-efficient entry, and full table layout.
-- iPad: touch-sized controls, collapsible sidebar, and horizontally scrollable tables only where necessary.
+- iPad Version 02: touch-sized controls, collapsible sidebar, and horizontally
+  scrollable tables only where necessary.
 - iPhone: intentionally unsupported in the first version.
 
 ## Accessibility baseline

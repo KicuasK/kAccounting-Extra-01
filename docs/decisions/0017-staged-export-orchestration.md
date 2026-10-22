@@ -38,6 +38,8 @@ questions.
 ## Consequences
 
 Future API and UI code has one safe entry point for publishing an already
-consistent export instead of reimplementing the sequence. The remaining next
-step is live-book snapshot orchestration: creating that consistent staging tree
-from one SQLite snapshot and the immutable attachment set referenced by it.
+consistent export instead of reimplementing the sequence. ADR 0018 creates the
+verified staging tree from one SQLite snapshot and an explicit immutable
+attachment set, ADR 0019 composes both workflows, and ADRs 0020–0021 add durable
+state and restart classification. Selecting the database-referenced attachment
+set atomically remains the future attachment repository's responsibility.

@@ -23,8 +23,14 @@ Use an adjacency list in `accounts`:
 - Restricted foreign keys prevent deleting a parent before its children.
 - Every mutable row carries a monotonic `revision` used for optimistic concurrency.
 - A trigger requires every update, including direct SQL, to advance `revision` by exactly one.
+- Once a revision reaches SQLite's maximum signed integer, repository updates
+  fail with an explicit exhaustion error instead of overflowing; deletion may
+  still proceed because it does not advance the row revision.
 
 The Rust access layer repeats essential validation and reconstructs a defensive tree before hierarchical data reaches the UI.
+Stored account rows are decoded defensively as well: non-positive identifiers
+or revisions, non-boolean activation values, and names that do not match the
+accepted normalized form are rejected if database constraints were bypassed.
 
 ## Alternatives considered
 
@@ -51,6 +57,9 @@ Rejected. Explicit element values make filtering and reporting clearer. Database
 - Descendants inherit accounting-element validity through enforced equality, not implicit UI behavior.
 - A posting account is structurally guaranteed to be a leaf.
 - Recursive queries or Rust tree reconstruction are required for ancestry and nested presentation.
+- Defensive Rust tree validation, reconstruction, and lineage reads run
+  iteratively, so a malformed cycle or unusually deep hierarchy does not
+  exhaust the call stack before returning a tree, path, or structural error.
 - Sibling ordering remains creation order until the user decides whether explicit ordering is needed.
 
 ## Explicit non-decisions

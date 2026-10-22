@@ -113,6 +113,108 @@ fn rejects_unknown_stored_enum_values() {
 }
 
 #[tokio::test]
+async fn repository_rejects_a_non_boolean_stored_activation_state() {
+    let (repository, pool) = repository_with_pool().await;
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass CHECK constraints");
+    let account_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO accounts (name, element, kind, is_active)
+        VALUES ('損壞狀態', 'asset', 'posting', 2)
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("STRICT INTEGER storage should still permit the corrupted value");
+
+    let error = repository
+        .get(kaccounting_backend::accounting::accounts::AccountId::new(
+            account_id,
+        ))
+        .await
+        .expect_err("repository must not decode a non-boolean state as active");
+
+    assert!(matches!(
+        error,
+        AccountError::InvalidStoredValue {
+            field: "is_active",
+            value,
+        } if value == "2"
+    ));
+}
+
+#[tokio::test]
+async fn repository_rejects_corrupted_stored_ids_names_and_revisions() {
+    let (repository, pool) = repository_with_pool().await;
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass CHECK constraints");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass foreign keys");
+    for drop_trigger_sql in [
+        "DROP TRIGGER accounts_require_initial_revision",
+        "DROP TRIGGER accounts_validate_parent_insert",
+    ] {
+        sqlx::query(drop_trigger_sql)
+            .execute(&pool)
+            .await
+            .expect("test setup should bypass the matching insert trigger");
+    }
+
+    sqlx::query(
+        "INSERT INTO accounts (id, name, element, kind) VALUES (0, '錯誤識別碼', 'asset', 'posting')",
+    )
+    .execute(&pool)
+    .await
+    .expect("test setup should insert a non-positive id");
+    let invalid_name_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, element, kind) VALUES (' 未修剪 ', 'asset', 'posting') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("test setup should insert an unnormalized name");
+    let invalid_revision_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, element, kind, revision) VALUES ('錯誤版本', 'asset', 'posting', 0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("test setup should insert a non-positive revision");
+    let invalid_parent_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (parent_id, name, element, kind) VALUES (-1, '錯誤父節點', 'asset', 'posting') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("test setup should insert a non-positive parent id");
+
+    for (id, field, value) in [
+        (0, "id", "0"),
+        (invalid_name_id, "name", " 未修剪 "),
+        (invalid_revision_id, "revision", "0"),
+        (invalid_parent_id, "parent_id", "-1"),
+    ] {
+        let error = repository
+            .get(kaccounting_backend::accounting::accounts::AccountId::new(
+                id,
+            ))
+            .await
+            .expect_err("repository must reject a corrupted stored scalar");
+        assert!(matches!(
+            error,
+            AccountError::InvalidStoredValue {
+                field: actual_field,
+                value: actual_value,
+            } if actual_field == field && actual_value == value
+        ));
+    }
+}
+
+#[tokio::test]
 async fn rejects_blank_and_oversized_names_before_writing() {
     let repository = repository().await;
 
@@ -214,7 +316,7 @@ async fn rust_and_sqlite_reject_every_c0_and_c1_control_character() {
 
 #[tokio::test]
 async fn rust_and_sqlite_agree_on_non_control_edge_whitespace() {
-    let (_repository, pool) = repository_with_pool().await;
+    let (repository, pool) = repository_with_pool().await;
     let edge_whitespace_codepoints = [
         160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233,
         8239, 8287, 12288,
@@ -227,6 +329,18 @@ async fn rust_and_sqlite_agree_on_non_control_edge_whitespace() {
 
         let name = format!("{character}科目{character}");
         assert_eq!(name.trim(), "科目");
+        let normalized = repository
+            .create(NewAccount::new(
+                None,
+                name.as_str(),
+                AccountingElement::Asset,
+                AccountKind::Posting,
+            ))
+            .await
+            .expect("repository should normalize every supported edge whitespace character");
+        assert_eq!(normalized.name, "科目");
+        repository.delete(normalized.id, normalized.revision).await.expect("remove this isolated fixture so SQLite rejection tests whitespace rather than uniqueness");
+
         let sqlite_result = sqlx::query(
             "INSERT INTO accounts (name, element, kind) VALUES (?, 'asset', 'posting')",
         )
@@ -456,6 +570,67 @@ async fn rejects_hierarchy_cycles() {
 }
 
 #[tokio::test]
+async fn failed_moves_preserve_the_complete_snapshot_and_stale_conflicts_take_precedence() {
+    let repository = repository().await;
+    let assets = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &repository,
+        Some(assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let renamed = repository
+        .rename(cash.id, cash.revision, "手邊現金")
+        .await
+        .expect("rename should produce a newer snapshot");
+    let missing_parent = kaccounting_backend::accounting::accounts::AccountId::new(999);
+
+    let stale_error = repository
+        .move_to(cash.id, cash.revision, Some(missing_parent))
+        .await
+        .expect_err("a stale move must not evaluate an invalid destination against newer state");
+    assert!(matches!(
+        stale_error,
+        AccountError::RevisionConflict {
+            expected: 1,
+            actual: 2,
+        }
+    ));
+    assert_eq!(
+        repository
+            .get(cash.id)
+            .await
+            .expect("stale move must leave the newer snapshot unchanged"),
+        renamed
+    );
+
+    let invalid_destination_error = repository
+        .move_to(renamed.id, renamed.revision, Some(missing_parent))
+        .await
+        .expect_err("the current snapshot must reject a missing destination");
+    assert!(matches!(
+        invalid_destination_error,
+        AccountError::ParentNotFound
+    ));
+    assert_eq!(
+        repository
+            .get(cash.id)
+            .await
+            .expect("failed current move must preserve every stored field"),
+        renamed
+    );
+}
+
+#[tokio::test]
 async fn refuses_to_turn_a_parent_into_a_posting_account() {
     let repository = repository().await;
     let assets = create_account(
@@ -590,6 +765,38 @@ async fn posting_eligibility_requires_an_active_posting_leaf() {
 }
 
 #[tokio::test]
+async fn posting_eligibility_fails_closed_when_storage_contains_a_posting_parent() {
+    let (repository, pool) = repository_with_pool().await;
+    let cash = create_account(
+        &repository,
+        None,
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    sqlx::query("DROP TRIGGER accounts_validate_parent_insert")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass posting-parent validation");
+    sqlx::query(
+        "INSERT INTO accounts (parent_id, name, element, kind) VALUES (?, '損壞子節點', 'asset', 'posting')",
+    )
+    .bind(cash.id.get())
+    .execute(&pool)
+    .await
+    .expect("test setup should create a posting parent only in the disposable database");
+
+    let error = repository
+        .require_postable(cash.id)
+        .await
+        .expect_err("a corrupted posting parent must never become eligible for journal lines");
+
+    assert!(matches!(error, AccountError::PostingAccountHasChildren));
+}
+
+#[tokio::test]
 async fn a_parent_cannot_be_deleted_before_its_children() {
     let repository = repository().await;
     let assets = create_account(
@@ -635,6 +842,141 @@ async fn a_parent_cannot_be_deleted_before_its_children() {
     assert!(
         replacement.id.get() > cash.id.get(),
         "deleted account identifiers must never be reused"
+    );
+}
+
+#[tokio::test]
+async fn delete_prioritizes_revision_conflicts_and_preserves_a_parent_with_children() {
+    let repository = repository().await;
+    let assets = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &repository,
+        Some(assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let renamed_assets = repository
+        .rename(assets.id, assets.revision, "資產總類")
+        .await
+        .expect("parent rename should advance its revision");
+
+    let stale_error = repository
+        .delete(assets.id, assets.revision)
+        .await
+        .expect_err("a stale delete must report its conflict before relationship constraints");
+    assert!(matches!(
+        stale_error,
+        AccountError::RevisionConflict {
+            expected: 1,
+            actual: 2,
+        }
+    ));
+
+    let current_error = repository
+        .delete(renamed_assets.id, renamed_assets.revision)
+        .await
+        .expect_err("the current parent revision must still be protected by its child");
+    assert!(matches!(current_error, AccountError::HasChildren));
+    assert_eq!(
+        repository
+            .get(renamed_assets.id)
+            .await
+            .expect("both rejected deletes must preserve the parent"),
+        renamed_assets
+    );
+    assert_eq!(
+        repository
+            .get(cash.id)
+            .await
+            .expect("both rejected deletes must preserve the child"),
+        cash
+    );
+}
+
+#[tokio::test]
+async fn journal_references_do_not_mask_revision_conflicts_or_allow_destructive_changes() {
+    let (repository, pool) = repository_with_pool().await;
+    let cash = create_account(
+        &repository,
+        None,
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let entry_id: i64 = sqlx::query_scalar(
+        "INSERT INTO journal_entries (entry_date) VALUES ('2026-10-22') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("test draft should be created");
+    sqlx::query(
+        r#"
+        INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
+        VALUES (?, 1, ?, 'debit', 100)
+        "#,
+    )
+    .bind(entry_id)
+    .bind(cash.id.get())
+    .execute(&pool)
+    .await
+    .expect("test draft should reference the posting account");
+    let renamed = repository
+        .rename(cash.id, cash.revision, "手邊現金")
+        .await
+        .expect("a journal reference must not freeze descriptive account fields");
+
+    let stale_delete = repository
+        .delete(cash.id, cash.revision)
+        .await
+        .expect_err("stale deletion should report its revision conflict first");
+    assert!(matches!(
+        stale_delete,
+        AccountError::RevisionConflict {
+            expected: 1,
+            actual: 2,
+        }
+    ));
+    let current_delete = repository
+        .delete(renamed.id, renamed.revision)
+        .await
+        .expect_err("a current deletion must preserve an account used by a draft");
+    assert!(matches!(current_delete, AccountError::HasDraftReferences));
+
+    let stale_classification = repository
+        .change_kind(cash.id, cash.revision, AccountKind::Category)
+        .await
+        .expect_err("stale classification should report its revision conflict first");
+    assert!(matches!(
+        stale_classification,
+        AccountError::RevisionConflict {
+            expected: 1,
+            actual: 2,
+        }
+    ));
+    let current_classification = repository
+        .change_kind(renamed.id, renamed.revision, AccountKind::Category)
+        .await
+        .expect_err("a current classification change must preserve referenced semantics");
+    assert!(matches!(
+        current_classification,
+        AccountError::JournalHistoryLocksClassification
+    ));
+    assert_eq!(
+        repository
+            .get(renamed.id)
+            .await
+            .expect("all rejected destructive changes must preserve the latest snapshot"),
+        renamed
     );
 }
 
@@ -732,6 +1074,127 @@ async fn database_requires_every_raw_update_to_advance_one_revision() {
         .expect("rejected updates must leave the account unchanged");
     assert_eq!(unchanged.name, "現金");
     assert_eq!(unchanged.revision, 1);
+}
+
+#[tokio::test]
+async fn repository_mutations_fail_closed_when_revision_is_exhausted() {
+    let (repository, pool) = repository_with_pool().await;
+    let cash = create_account(
+        &repository,
+        None,
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let ordinary = create_account(
+        &repository,
+        None,
+        "零用金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    let stale_error = repository
+        .rename(ordinary.id, i64::MAX, "新零用金")
+        .await
+        .expect_err("a mismatched maximum revision is a conflict, not exhaustion");
+    assert!(matches!(
+        stale_error,
+        AccountError::RevisionConflict {
+            expected: i64::MAX,
+            actual: 1,
+        }
+    ));
+
+    sqlx::query("DROP TRIGGER accounts_require_next_revision")
+        .execute(&pool)
+        .await
+        .expect("test setup should temporarily bypass revision sequencing");
+    sqlx::query("UPDATE accounts SET revision = ? WHERE id = ?")
+        .bind(i64::MAX)
+        .bind(cash.id.get())
+        .execute(&pool)
+        .await
+        .expect("test setup should exhaust revision only in the disposable database");
+    sqlx::query(
+        r#"
+        CREATE TRIGGER accounts_require_next_revision
+        BEFORE UPDATE ON accounts
+        WHEN NEW.revision <> OLD.revision + 1
+        BEGIN
+            SELECT RAISE(ABORT, 'account revision must increase by one');
+        END
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("test setup should restore revision sequencing");
+
+    let exhausted = repository
+        .get(cash.id)
+        .await
+        .expect("exhausted account should remain readable");
+    assert_eq!(exhausted.revision, i64::MAX);
+
+    sqlx::query("UPDATE accounts SET name = '溢位', revision = revision + 1 WHERE id = ?")
+        .bind(cash.id.get())
+        .execute(&pool)
+        .await
+        .expect_err("SQLite must independently reject an overflowing raw revision update");
+    assert_eq!(
+        repository
+            .get(cash.id)
+            .await
+            .expect("failed raw update must preserve the exhausted account"),
+        exhausted
+    );
+
+    let errors = [
+        repository
+            .rename(cash.id, i64::MAX, "手邊現金")
+            .await
+            .expect_err("rename must fail before revision overflow"),
+        repository
+            .move_to(cash.id, i64::MAX, None)
+            .await
+            .expect_err("move must fail before revision overflow"),
+        repository
+            .change_element(cash.id, i64::MAX, AccountingElement::Expense)
+            .await
+            .expect_err("element change must fail before revision overflow"),
+        repository
+            .change_kind(cash.id, i64::MAX, AccountKind::Category)
+            .await
+            .expect_err("kind change must fail before revision overflow"),
+        repository
+            .set_active(cash.id, i64::MAX, false)
+            .await
+            .expect_err("activation change must fail before revision overflow"),
+    ];
+
+    assert!(
+        errors.iter().all(
+            |error| matches!(error, AccountError::RevisionExhausted(id) if *id == cash.id.get())
+        )
+    );
+    assert_eq!(
+        repository
+            .get(cash.id)
+            .await
+            .expect("failed mutations must preserve the exhausted account"),
+        exhausted
+    );
+
+    repository
+        .delete(cash.id, i64::MAX)
+        .await
+        .expect("deletion need not advance an exhausted revision");
+    assert!(matches!(
+        repository.get(cash.id).await,
+        Err(AccountError::NotFound(id)) if id == cash.id.get()
+    ));
 }
 
 #[tokio::test]
@@ -884,6 +1347,67 @@ async fn builds_a_stable_nested_tree_for_the_ui() {
 }
 
 #[tokio::test]
+async fn tree_builder_preserves_supplied_order_when_children_precede_parents() {
+    let repository = repository().await;
+    let assets = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let current_assets = create_account(
+        &repository,
+        Some(assets.id),
+        "流動資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &repository,
+        Some(current_assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let bank = create_account(
+        &repository,
+        Some(current_assets.id),
+        "銀行存款",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let liabilities = create_account(
+        &repository,
+        None,
+        "負債",
+        AccountingElement::Liability,
+        AccountKind::Category,
+    )
+    .await;
+
+    let supplied = [
+        liabilities.clone(),
+        bank.clone(),
+        cash.clone(),
+        current_assets.clone(),
+        assets.clone(),
+    ];
+    let tree = build_account_tree(&supplied)
+        .expect("input order must not require parents to appear before children");
+
+    assert_eq!(tree[0].account.id, liabilities.id);
+    assert_eq!(tree[1].account.id, assets.id);
+    assert_eq!(tree[1].children[0].account.id, current_assets.id);
+    assert_eq!(tree[1].children[0].children[0].account.id, bank.id);
+    assert_eq!(tree[1].children[0].children[1].account.id, cash.id);
+}
+
+#[tokio::test]
 async fn tree_builder_rejects_duplicate_and_missing_ids() {
     let repository = repository().await;
     let assets = create_account(
@@ -914,6 +1438,69 @@ async fn tree_builder_rejects_duplicate_and_missing_ids() {
             account_id: orphan.id.get(),
             parent_id: 999,
         }
+    );
+}
+
+#[tokio::test]
+async fn repository_tree_fails_closed_on_a_late_corrupted_orphan() {
+    let (repository, pool) = repository_with_pool().await;
+    let assets = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &repository,
+        Some(assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let bank = create_account(
+        &repository,
+        Some(assets.id),
+        "銀行存款",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    sqlx::query("DROP TRIGGER accounts_validate_parent_update")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass repository-independent parent validation");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass the parent foreign key");
+    sqlx::query("UPDATE accounts SET parent_id = 999, revision = revision + 1 WHERE id = ?")
+        .bind(bank.id.get())
+        .execute(&pool)
+        .await
+        .expect("test setup should corrupt only the final row in the disposable database");
+
+    let error = repository
+        .list_tree()
+        .await
+        .expect_err("tree loading must reject the whole result rather than return valid prefixes");
+
+    assert!(matches!(
+        error,
+        AccountError::CorruptTree(AccountTreeError::MissingParent {
+            account_id,
+            parent_id: 999,
+        }) if account_id == bank.id.get()
+    ));
+    assert_eq!(
+        repository
+            .get(cash.id)
+            .await
+            .expect("unrelated valid rows should remain individually readable"),
+        cash
     );
 }
 
@@ -983,6 +1570,132 @@ async fn tree_builder_rechecks_parent_kind_and_element() {
 }
 
 #[tokio::test]
+async fn tree_builder_handles_a_very_deep_child_first_hierarchy_without_using_the_call_stack() {
+    const ACCOUNT_COUNT: i64 = 50_000;
+
+    let repository = repository().await;
+    let template = create_account(
+        &repository,
+        None,
+        "深層科目",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let mut accounts: Vec<_> = (1..=ACCOUNT_COUNT)
+        .map(|id| {
+            let mut account = template.clone();
+            account.id = kaccounting_backend::accounting::accounts::AccountId::new(id);
+            account.parent_id =
+                (id > 1).then(|| kaccounting_backend::accounting::accounts::AccountId::new(id - 1));
+            account.kind = if id == ACCOUNT_COUNT {
+                AccountKind::Posting
+            } else {
+                AccountKind::Category
+            };
+            account
+        })
+        .collect();
+    accounts.reverse();
+
+    let tree = build_account_tree(&accounts)
+        .expect("a child-first deep hierarchy should not depend on recursive call-stack space");
+    let mut node = &tree[0];
+    let mut observed_count = 1;
+    while let Some(child) = node.children.first() {
+        observed_count += 1;
+        node = child;
+    }
+
+    assert_eq!(observed_count, ACCOUNT_COUNT);
+    assert_eq!(node.account.id.get(), ACCOUNT_COUNT);
+
+    // Drain the recursive DTO iteratively as well, so this intentionally extreme
+    // fixture does not make the test harness recursively drop 50,000 nodes.
+    let mut pending = tree;
+    while let Some(mut node) = pending.pop() {
+        pending.append(&mut node.children);
+    }
+}
+
+#[tokio::test]
+async fn tree_builder_handles_a_very_wide_child_first_hierarchy_in_supplied_order() {
+    const CHILD_COUNT: i64 = 50_000;
+
+    let repository = repository().await;
+    let root = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let template = create_account(
+        &repository,
+        Some(root.id),
+        "明細科目",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let mut accounts = Vec::with_capacity((CHILD_COUNT + 1) as usize);
+    accounts.push(root.clone());
+    accounts.extend((1..=CHILD_COUNT).map(|offset| {
+        let mut account = template.clone();
+        account.id = kaccounting_backend::accounting::accounts::AccountId::new(offset + 1);
+        account
+    }));
+    accounts.rotate_left(1);
+
+    let tree = build_account_tree(&accounts).expect("wide child-first hierarchy should build");
+
+    assert_eq!(tree.len(), 1);
+    assert_eq!(tree[0].children.len(), CHILD_COUNT as usize);
+    assert_eq!(tree[0].children[0].account.id.get(), 2);
+    assert_eq!(
+        tree[0]
+            .children
+            .last()
+            .expect("last child")
+            .account
+            .id
+            .get(),
+        CHILD_COUNT + 1
+    );
+}
+
+#[tokio::test]
+async fn tree_builder_rejects_a_very_deep_cycle_without_using_the_call_stack() {
+    const ACCOUNT_COUNT: i64 = 50_000;
+
+    let repository = repository().await;
+    let template = create_account(
+        &repository,
+        None,
+        "循環科目",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let accounts: Vec<_> = (1..=ACCOUNT_COUNT)
+        .map(|id| {
+            let mut account = template.clone();
+            account.id = kaccounting_backend::accounting::accounts::AccountId::new(id);
+            account.parent_id = Some(kaccounting_backend::accounting::accounts::AccountId::new(
+                if id == 1 { ACCOUNT_COUNT } else { id - 1 },
+            ));
+            account
+        })
+        .collect();
+
+    let error = build_account_tree(&accounts)
+        .expect_err("a deep cycle must return a structural error instead of overflowing the stack");
+
+    assert!(matches!(error, AccountTreeError::Cycle(_)));
+}
+
+#[tokio::test]
 async fn mutations_increment_revision_and_reject_stale_clients() {
     let repository = repository().await;
     let cash = create_account(
@@ -1027,6 +1740,59 @@ async fn mutations_increment_revision_and_reject_stale_clients() {
         .expect("latest revision should reactivate");
     assert!(reactivated.is_active);
     assert_eq!(reactivated.revision, 4);
+}
+
+#[tokio::test]
+async fn same_value_mutations_are_versioned_updates_not_silent_noops() {
+    let repository = repository().await;
+    let original = create_account(
+        &repository,
+        None,
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    let renamed = repository
+        .rename(original.id, original.revision, original.name.as_str())
+        .await
+        .expect("same-name update should still consume its expected revision");
+    let moved = repository
+        .move_to(renamed.id, renamed.revision, renamed.parent_id)
+        .await
+        .expect("same-parent update should still consume its expected revision");
+    let reelemented = repository
+        .change_element(moved.id, moved.revision, moved.element)
+        .await
+        .expect("same-element update should still consume its expected revision");
+    let rekinded = repository
+        .change_kind(reelemented.id, reelemented.revision, reelemented.kind)
+        .await
+        .expect("same-kind update should still consume its expected revision");
+    let reactivated = repository
+        .set_active(rekinded.id, rekinded.revision, rekinded.is_active)
+        .await
+        .expect("same-activation update should still consume its expected revision");
+
+    assert_eq!(reactivated.revision, original.revision + 5);
+    assert_eq!(reactivated.parent_id, original.parent_id);
+    assert_eq!(reactivated.name, original.name);
+    assert_eq!(reactivated.element, original.element);
+    assert_eq!(reactivated.kind, original.kind);
+    assert_eq!(reactivated.is_active, original.is_active);
+
+    let stale_error = repository
+        .set_active(original.id, original.revision, false)
+        .await
+        .expect_err("the initial snapshot must be stale after same-value updates");
+    assert!(matches!(
+        stale_error,
+        AccountError::RevisionConflict {
+            expected: 1,
+            actual: 6,
+        }
+    ));
 }
 
 #[tokio::test]
@@ -1136,6 +1902,209 @@ async fn moves_a_same_element_subtree_without_rewriting_descendants() {
     assert_eq!(unchanged_cash.parent_id, Some(payment_group.id));
     assert_eq!(unchanged_cash.revision, cash.revision);
     assert_eq!(path_names, ["第二組資產", "支付型", "現金"]);
+}
+
+#[tokio::test]
+async fn moving_an_inactive_posting_account_preserves_eligibility_state_and_path() {
+    let repository = repository().await;
+    let first_group = create_account(
+        &repository,
+        None,
+        "第一組資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let second_group = create_account(
+        &repository,
+        None,
+        "第二組資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &repository,
+        Some(first_group.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    let inactive = repository
+        .set_active(cash.id, cash.revision, false)
+        .await
+        .expect("posting account should deactivate");
+    let moved = repository
+        .move_to(inactive.id, inactive.revision, Some(second_group.id))
+        .await
+        .expect("inactive posting account should still support a valid structural move");
+    let path = repository
+        .path_to(moved.id)
+        .await
+        .expect("path should reflect the move");
+
+    assert!(!moved.is_active);
+    assert_eq!(moved.revision, 3);
+    assert_eq!(
+        path.iter()
+            .map(|account| account.name.as_str())
+            .collect::<Vec<_>>(),
+        ["第二組資產", "現金"]
+    );
+    assert!(matches!(
+        repository.require_postable(moved.id).await,
+        Err(AccountError::Inactive)
+    ));
+
+    let reactivated = repository
+        .set_active(moved.id, moved.revision, true)
+        .await
+        .expect("moved posting account should reactivate");
+    assert_eq!(reactivated.revision, 4);
+    assert_eq!(
+        repository
+            .require_postable(reactivated.id)
+            .await
+            .expect("reactivated posting leaf should be eligible"),
+        reactivated
+    );
+}
+
+#[tokio::test]
+async fn moving_an_older_account_preserves_creation_order_under_its_new_parent() {
+    let repository = repository().await;
+    let first_group = create_account(
+        &repository,
+        None,
+        "第一組資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let second_group = create_account(
+        &repository,
+        None,
+        "第二組資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let older_cash = create_account(
+        &repository,
+        Some(first_group.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    let newer_bank = create_account(
+        &repository,
+        Some(second_group.id),
+        "銀行存款",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    repository
+        .move_to(older_cash.id, older_cash.revision, Some(second_group.id))
+        .await
+        .expect("same-element move should succeed");
+    let tree = repository.list_tree().await.expect("tree should rebuild");
+    let destination = tree
+        .iter()
+        .find(|node| node.account.id == second_group.id)
+        .expect("destination root should remain present");
+
+    assert_eq!(
+        destination
+            .children
+            .iter()
+            .map(|node| node.account.id)
+            .collect::<Vec<_>>(),
+        [older_cash.id, newer_bank.id]
+    );
+    assert_eq!(
+        repository
+            .path_to(older_cash.id)
+            .await
+            .expect("path should agree with the rebuilt tree")
+            .iter()
+            .map(|account| account.id)
+            .collect::<Vec<_>>(),
+        [second_group.id, older_cash.id]
+    );
+}
+
+#[tokio::test]
+async fn repeated_valid_moves_keep_revision_tree_and_path_consistent() {
+    const MOVE_COUNT: i64 = 512;
+
+    let repository = repository().await;
+    let first_group = create_account(
+        &repository,
+        None,
+        "第一組資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let second_group = create_account(
+        &repository,
+        None,
+        "第二組資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let mut cash = create_account(
+        &repository,
+        Some(first_group.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    for move_number in 1..=MOVE_COUNT {
+        let destination = if move_number % 2 == 1 {
+            second_group.id
+        } else {
+            first_group.id
+        };
+        cash = repository
+            .move_to(cash.id, cash.revision, Some(destination))
+            .await
+            .expect("every alternating same-element move should succeed");
+    }
+
+    assert_eq!(cash.revision, MOVE_COUNT + 1);
+    assert_eq!(cash.parent_id, Some(first_group.id));
+    assert_eq!(
+        repository
+            .path_to(cash.id)
+            .await
+            .expect("path should reflect the final move")
+            .iter()
+            .map(|account| account.id)
+            .collect::<Vec<_>>(),
+        [first_group.id, cash.id]
+    );
+    let tree = repository
+        .list_tree()
+        .await
+        .expect("tree should remain valid");
+    assert_eq!(
+        tree.iter()
+            .find(|node| node.account.id == first_group.id)
+            .expect("final parent should remain present")
+            .children[0]
+            .account
+            .id,
+        cash.id
+    );
 }
 
 #[tokio::test]
@@ -1301,4 +2270,173 @@ async fn returns_an_account_path_from_root_to_leaf() {
         .await
         .expect_err("missing account path should return not found");
     assert!(matches!(missing_error, AccountError::NotFound(999)));
+}
+
+#[tokio::test]
+async fn account_path_rejects_a_corrupted_missing_parent() {
+    let (repository, pool) = repository_with_pool().await;
+    let assets = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &repository,
+        Some(assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+
+    sqlx::query("DROP TRIGGER accounts_validate_parent_update")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass the parent trigger");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass the foreign key");
+    sqlx::query("UPDATE accounts SET parent_id = 999, revision = revision + 1 WHERE id = ?")
+        .bind(cash.id.get())
+        .execute(&pool)
+        .await
+        .expect("test setup should create an orphan only in the disposable database");
+
+    let error = repository
+        .path_to(cash.id)
+        .await
+        .expect_err("a partial lineage must not be returned as a valid account path");
+
+    assert!(matches!(
+        error,
+        AccountError::CorruptTree(AccountTreeError::MissingParent {
+            account_id,
+            parent_id: 999,
+        }) if account_id == cash.id.get()
+    ));
+}
+
+#[tokio::test]
+async fn account_path_rejects_a_corrupted_cycle_without_recursive_sql() {
+    let (repository, pool) = repository_with_pool().await;
+    let assets = create_account(
+        &repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let current_assets = create_account(
+        &repository,
+        Some(assets.id),
+        "流動資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+
+    sqlx::query("DROP TRIGGER accounts_prevent_cycle_update")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass the cycle trigger");
+    sqlx::query("UPDATE accounts SET parent_id = ?, revision = revision + 1 WHERE id = ?")
+        .bind(current_assets.id.get())
+        .bind(assets.id.get())
+        .execute(&pool)
+        .await
+        .expect("test setup should create a cycle only in the disposable database");
+
+    let error = repository
+        .path_to(current_assets.id)
+        .await
+        .expect_err("a cyclic lineage must fail closed instead of recursively expanding");
+
+    assert!(matches!(
+        error,
+        AccountError::CorruptTree(AccountTreeError::Cycle(_))
+    ));
+}
+
+#[tokio::test]
+async fn account_path_rechecks_parent_kind_and_element() {
+    let (kind_repository, kind_pool) = repository_with_pool().await;
+    let assets = create_account(
+        &kind_repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let cash = create_account(
+        &kind_repository,
+        Some(assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    sqlx::query("DROP TRIGGER accounts_posting_kind_requires_leaf")
+        .execute(&kind_pool)
+        .await
+        .expect("test setup should bypass the posting-parent trigger");
+    sqlx::query("UPDATE accounts SET kind = 'posting', revision = revision + 1 WHERE id = ?")
+        .bind(assets.id.get())
+        .execute(&kind_pool)
+        .await
+        .expect("test setup should create a posting parent only in the disposable database");
+
+    let kind_error = kind_repository
+        .path_to(cash.id)
+        .await
+        .expect_err("a posting parent must invalidate an account path");
+    assert!(matches!(
+        kind_error,
+        AccountError::CorruptTree(AccountTreeError::PostingParent(id))
+            if id == assets.id.get()
+    ));
+
+    let (element_repository, element_pool) = repository_with_pool().await;
+    let other_assets = create_account(
+        &element_repository,
+        None,
+        "資產",
+        AccountingElement::Asset,
+        AccountKind::Category,
+    )
+    .await;
+    let other_cash = create_account(
+        &element_repository,
+        Some(other_assets.id),
+        "現金",
+        AccountingElement::Asset,
+        AccountKind::Posting,
+    )
+    .await;
+    sqlx::query("DROP TRIGGER accounts_preserve_child_elements")
+        .execute(&element_pool)
+        .await
+        .expect("test setup should bypass the child-element trigger");
+    sqlx::query("UPDATE accounts SET element = 'liability', revision = revision + 1 WHERE id = ?")
+        .bind(other_assets.id.get())
+        .execute(&element_pool)
+        .await
+        .expect("test setup should split elements only in the disposable database");
+
+    let element_error = element_repository
+        .path_to(other_cash.id)
+        .await
+        .expect_err("an element mismatch must invalidate an account path");
+    assert!(matches!(
+        element_error,
+        AccountError::CorruptTree(AccountTreeError::ElementMismatch {
+            account_id,
+            parent_id,
+        }) if account_id == other_cash.id.get() && parent_id == other_assets.id.get()
+    ));
 }

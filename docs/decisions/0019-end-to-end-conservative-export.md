@@ -14,6 +14,9 @@ published-but-unverified output, verified success, and cleanup warnings.
 
 - Require separate caller-selected locations for local private work and the
   public `.kagextra` destination.
+- Resolve both locations before snapshot work and reject a public destination
+  whose parent is the local private work parent or any directory below it.
+  This keeps recoverable private state outside the public artifact boundary.
 - Reject a known destination conflict before taking a database snapshot or
   copying an attachment.
 - Allocate a unique owner-only snapshot staging directory under the local work
@@ -38,5 +41,6 @@ have deterministic outcomes.
 
 The remaining consistency integration is the future attachment repository's
 responsibility: it must select the database-referenced attachment set under the
-same logical live-book boundary. Durable operation-state files and physical
-removable-drive interruption testing also remain pending.
+same logical live-book boundary. ADR 0020 and ADR 0021 add durable operation
+state and restart classification. Physical removable-drive interruption
+testing remains pending.

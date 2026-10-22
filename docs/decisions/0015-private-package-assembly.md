@@ -17,6 +17,11 @@ its validated logical manifest, the assembler:
    that file;
 6. loads and verifies the complete physical package again.
 
+The private work path must resolve outside the source staging tree. Assembly
+rejects a work path nested anywhere below the source before creating it, so the
+act of assembling cannot add undeclared objects to or otherwise mutate the
+already verified source.
+
 The source remains unchanged. An existing work path is never reused or
 modified. If assembly fails after work begins, the incomplete private directory
 remains distinguishable for explicit recovery or cleanup rather than being

@@ -24,6 +24,9 @@ Copying only the main file of a live WAL database can omit committed pages or pr
 - Callers must choose an existing destination directory outside the source repository and use a file-backed source pool; the primitive does not create an unapproved directory tree.
 - A successful return proves that the published snapshot passed the current application integrity audit and retained owner-only permissions. Callers must inspect the outcome for a non-fatal cleanup warning.
 - Existing destinations, including symlinks, are refused without content changes.
-- Scheduling, naming, retention, encryption, and the final Application Support/backup directories remain unresolved operational policy.
+- Application-managed backups require at-rest encryption and the newest 10
+  local backups are retained by default. Scheduling, naming, the final
+  Application Support/backup directories, and the reviewed cryptographic and
+  key-management design remain unresolved implementation policy.
 - Restore is not implemented by this decision. A restore workflow must preserve the current database, verify the candidate, and define explicit replacement/rollback behavior before it is added.
 - `verify_database_snapshot` may be used to inspect a restore candidate without enabling WAL, migrating, chmodding, or otherwise changing it; successful inspection alone does not authorize replacement of the live database.

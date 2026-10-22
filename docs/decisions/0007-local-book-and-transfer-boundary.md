@@ -60,7 +60,8 @@ because cleanup of private work state failed.
 
 - attachment identifier format (content integrity uses SHA-256 per ADR 0008);
 - attachment ownership, allowed types, limits, deduplication, and retention;
-- encryption and key management;
+- cryptographic format and key management (encryption at rest is required by
+  the accepted Version 01 product decision);
 - supported removable-drive file systems;
 - backup schedule and retention.
 
@@ -70,3 +71,9 @@ Storage code must separate creation, publication, verification, and cleanup so
 that post-publication cleanup cannot turn a successful result into an ambiguous
 failure. Tests must inject failures at each boundary before the transfer flow is
 used by an API or UI.
+
+ADRs 0010–0021 implement the read-only package verifier, conservative export,
+durable export state, and restart classification for an explicit attachment
+set. They do not yet implement live-book import replacement, prove attachment
+reference completeness, select removable-drive compatibility, or expose a
+transfer API or UI.

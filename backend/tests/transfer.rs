@@ -8,10 +8,15 @@ use kaccounting_backend::storage::{
 use kaccounting_backend::transfer::{
     LiveBookExportError, STAGED_DATABASE_PATH, TransferAttachmentSource, TransferExportError,
     TransferOperationState, TransferPackageAssemblyError, TransferPackagePublishError,
-    TransferPackageVerificationError, TransferStagingError, TransferStateTransitionError,
-    TransferVerificationError, assemble_private_transfer_package, export_live_book_snapshot,
-    export_staged_transfer_package, load_and_verify_transfer_package, prepare_transfer_staging,
-    publish_private_transfer_package, verify_staged_transfer,
+    TransferPackageVerificationError, TransferRecoveryError, TransferRecoveryOutcome,
+    TransferStagingError, TransferStateTransitionError, TransferVerificationError,
+    assemble_private_transfer_package, export_live_book_snapshot, export_staged_transfer_package,
+    load_and_verify_transfer_package, prepare_transfer_staging, publish_private_transfer_package,
+    recover_export_work_state, verify_staged_transfer,
+};
+use kaccounting_backend::transfer_state::{
+    TRANSFER_WORK_STATE_FILE_NAME, TransferWorkStateError, create_export_work_state,
+    load_transfer_work_state, transition_transfer_work_state,
 };
 
 #[test]
@@ -140,6 +145,31 @@ async fn staged_transfer_rejects_symlink_objects() {
     fixture.remove_without_attachment();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn staged_transfer_rejects_symlinked_intermediate_attachment_directories() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TransferFixture::create("symlinked-attachment-directory").await;
+    let external_attachments = unique_path("external-staged-attachments");
+    std::fs::rename(&fixture.attachment_directory, &external_attachments)
+        .expect("attachment directory should move outside staging");
+    symlink(&external_attachments, &fixture.attachment_directory)
+        .expect("attachment directory symlink should be created");
+
+    assert!(matches!(
+        verify_staged_transfer(&fixture.root, &fixture.manifest).await,
+        Err(TransferVerificationError::UnsafeObjectType { path })
+            if path == fixture.attachment_directory
+    ));
+
+    std::fs::remove_file(&fixture.attachment_directory)
+        .expect("attachment directory symlink should be removed");
+    std::fs::rename(&external_attachments, &fixture.attachment_directory)
+        .expect("attachment directory should be restored");
+    fixture.remove();
+}
+
 #[tokio::test]
 async fn complete_package_loads_manifest_and_verifies_exact_layout() {
     let fixture = TransferFixture::create("complete-package").await;
@@ -151,6 +181,207 @@ async fn complete_package_loads_manifest_and_verifies_exact_layout() {
 
     assert_eq!(loaded, fixture.manifest);
     fixture.remove();
+}
+
+#[tokio::test]
+async fn package_manifest_rejects_missing_duplicate_and_unknown_fields() {
+    let fixture = TransferFixture::create("strict-manifest-package").await;
+    let canonical = fixture
+        .manifest
+        .to_json_bytes()
+        .expect("fixture manifest should encode");
+    let canonical_value: serde_json::Value =
+        serde_json::from_slice(&canonical).expect("canonical manifest should parse as JSON");
+
+    let mut missing = canonical_value.clone();
+    missing
+        .as_object_mut()
+        .expect("manifest root should be an object")
+        .remove("attachments");
+    let mut unknown = canonical_value.clone();
+    unknown
+        .as_object_mut()
+        .expect("manifest root should be an object")
+        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+    let canonical_text = String::from_utf8(canonical).expect("manifest should be UTF-8");
+    let duplicate = canonical_text.replacen(
+        "\"format_version\": 1,",
+        "\"format_version\": 1,\n  \"format_version\": 1,",
+        1,
+    );
+
+    for invalid in [
+        serde_json::to_vec(&missing).expect("missing-field fixture should encode"),
+        serde_json::to_vec(&unknown).expect("unknown-field fixture should encode"),
+        duplicate.into_bytes(),
+    ] {
+        std::fs::write(fixture.manifest_path(), invalid)
+            .expect("invalid package manifest should be written");
+        assert!(matches!(
+            load_and_verify_transfer_package(&fixture.root).await,
+            Err(TransferPackageVerificationError::Manifest(_))
+        ));
+    }
+
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn package_manifest_rejects_noncanonical_integrity_fields_and_paths() {
+    let fixture = TransferFixture::create("invalid-manifest-values-package").await;
+    let canonical = fixture
+        .manifest
+        .to_json_bytes()
+        .expect("fixture manifest should encode");
+    let canonical_value: serde_json::Value =
+        serde_json::from_slice(&canonical).expect("canonical manifest should parse as JSON");
+    let mut invalid_documents = Vec::new();
+
+    for digest in [
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        "not-a-sha256-digest",
+    ] {
+        let mut document = canonical_value.clone();
+        document["database"]["sha256"] = serde_json::Value::String(digest.to_owned());
+        invalid_documents.push(document);
+    }
+    for byte_length in ["01", "18446744073709551616", "-1"] {
+        let mut document = canonical_value.clone();
+        document["database"]["byte_length"] = serde_json::Value::String(byte_length.to_owned());
+        invalid_documents.push(document);
+    }
+    for path in [
+        "attachments/./evidence.bin",
+        "attachments/../evidence.bin",
+        "attachments//evidence.bin",
+        "attachments\\evidence.bin",
+    ] {
+        let mut document = canonical_value.clone();
+        document["attachments"][0]["path"] = serde_json::Value::String(path.to_owned());
+        invalid_documents.push(document);
+    }
+
+    for invalid in invalid_documents {
+        std::fs::write(
+            fixture.manifest_path(),
+            serde_json::to_vec(&invalid).expect("invalid manifest fixture should encode"),
+        )
+        .expect("invalid package manifest should be written");
+        assert!(matches!(
+            load_and_verify_transfer_package(&fixture.root).await,
+            Err(TransferPackageVerificationError::Manifest(_))
+        ));
+    }
+
+    fixture.remove();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn package_manifest_permission_denied_fails_closed_when_os_denies_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = TransferFixture::create("unreadable-manifest-package").await;
+    fixture.write_manifest();
+    let manifest_path = fixture.manifest_path();
+    std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))
+        .expect("manifest permissions should be removable");
+
+    match std::fs::File::open(&manifest_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Ok(_) => {
+            std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600))
+                .expect("manifest permissions should be restorable");
+            fixture.remove();
+            return;
+        }
+        Err(error) => panic!("unexpected manifest open failure: {error}"),
+    }
+
+    let result = load_and_verify_transfer_package(&fixture.root).await;
+
+    std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600))
+        .expect("manifest permissions should be restorable");
+    assert!(matches!(
+        result,
+        Err(TransferPackageVerificationError::ReadManifest { path, source })
+            if path == manifest_path && source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(
+        std::fs::read(&fixture.attachment_path)
+            .expect("package attachment should remain readable after denial"),
+        b"original evidence"
+    );
+
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn package_round_trips_unicode_attachment_paths() {
+    let mut fixture = TransferFixture::create("unicode-package").await;
+    let unicode_directory = fixture.attachment_directory.join("收據");
+    let unicode_attachment = unicode_directory.join("證明-2026.txt");
+    std::fs::create_dir(&unicode_directory).expect("Unicode directory should be created");
+    std::fs::rename(&fixture.attachment_path, &unicode_attachment)
+        .expect("attachment should move to Unicode path");
+    fixture.attachment_path = unicode_attachment;
+    fixture.manifest = TransferManifest::new(
+        fixture.manifest.database(),
+        vec![ManifestAttachment::new(
+            "attachments/收據/證明-2026.txt",
+            describe_file(&fixture.attachment_path).expect("Unicode attachment should describe"),
+        )],
+    )
+    .expect("Unicode attachment path should validate");
+    fixture.write_manifest();
+
+    let loaded = load_and_verify_transfer_package(&fixture.root)
+        .await
+        .expect("Unicode package should verify");
+    assert_eq!(loaded, fixture.manifest);
+
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn package_verifies_every_object_in_a_large_attachment_list() {
+    const ATTACHMENT_COUNT: usize = 256;
+
+    let mut fixture = TransferFixture::create("large-attachment-list").await;
+    std::fs::remove_file(&fixture.attachment_path).expect("default attachment should be removed");
+    let bulk_root = fixture.attachment_directory.join("bulk");
+    std::fs::create_dir(&bulk_root).expect("bulk attachment directory should be created");
+    let mut attachments = Vec::with_capacity(ATTACHMENT_COUNT);
+    for index in 0..ATTACHMENT_COUNT {
+        let logical_path = format!("attachments/bulk/{index:04}.bin");
+        let path = fixture.root.join(&logical_path);
+        std::fs::write(&path, (index as u32).to_le_bytes())
+            .expect("bulk attachment should be written");
+        attachments.push(ManifestAttachment::new(
+            logical_path,
+            describe_file(&path).expect("bulk attachment should describe"),
+        ));
+    }
+    fixture.manifest = TransferManifest::new(fixture.manifest.database(), attachments)
+        .expect("large attachment manifest should validate");
+    fixture.write_manifest();
+
+    let loaded = load_and_verify_transfer_package(&fixture.root)
+        .await
+        .expect("every object in the large package should verify");
+    assert_eq!(loaded.attachments().len(), ATTACHMENT_COUNT);
+
+    let final_logical_path = format!("attachments/bulk/{:04}.bin", ATTACHMENT_COUNT - 1);
+    std::fs::write(fixture.root.join(&final_logical_path), [0_u8; 4])
+        .expect("last attachment should be corruptible");
+    assert!(matches!(
+        load_and_verify_transfer_package(&fixture.root).await,
+        Err(TransferPackageVerificationError::Content(
+            TransferVerificationError::Object { logical_path, .. }
+        )) if logical_path == final_logical_path
+    ));
+
+    fixture.remove_without_attachment();
 }
 
 #[tokio::test]
@@ -176,6 +407,27 @@ async fn package_rejects_undeclared_top_level_and_attachment_objects() {
     ));
     std::fs::remove_file(attachment_extra).expect("attachment extra should be removed");
 
+    fixture.remove();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn package_rejects_non_utf8_names() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = TransferFixture::create("non-utf8-layout").await;
+    fixture.write_manifest();
+    let non_utf8 = fixture.root.join(OsString::from_vec(vec![0xff, 0xfe]));
+    std::fs::write(&non_utf8, b"undeclared").expect("non-UTF-8 package entry should be creatable");
+
+    assert!(matches!(
+        load_and_verify_transfer_package(&fixture.root).await,
+        Err(TransferPackageVerificationError::UndeclaredObject { path })
+            if path == non_utf8
+    ));
+
+    std::fs::remove_file(non_utf8).expect("non-UTF-8 package entry should be removed");
     fixture.remove();
 }
 
@@ -221,6 +473,33 @@ async fn package_rejects_symlinked_manifest_and_attachment_directory() {
         .expect("attachment directory symlink should be removed");
     std::fs::rename(&external_attachments, &fixture.attachment_directory)
         .expect("attachment directory should be restored");
+    fixture.remove();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn package_rejects_special_files_in_attachment_layout() {
+    let fixture = TransferFixture::create("special-file-layout").await;
+    fixture.write_manifest();
+    let special_path = fixture.attachment_directory.join("control.pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&special_path)
+        .status()
+        .expect("mkfifo should run for the isolated package fixture");
+    assert!(status.success(), "named pipe fixture should be creatable");
+
+    assert!(matches!(
+        load_and_verify_transfer_package(&fixture.root).await,
+        Err(TransferPackageVerificationError::UnsafeObjectType { path })
+            if path == special_path
+    ));
+    assert_eq!(
+        std::fs::read(&fixture.attachment_path)
+            .expect("declared attachment should remain readable after layout rejection"),
+        b"original evidence"
+    );
+
+    std::fs::remove_file(special_path).expect("named pipe fixture should be removed");
     fixture.remove();
 }
 
@@ -313,6 +592,47 @@ async fn assembly_never_reuses_or_changes_an_existing_work_path() {
 
     std::fs::remove_file(sentinel).expect("sentinel should be removed");
     std::fs::remove_dir(work_root).expect("pre-existing work path should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn assembly_rejects_work_nested_inside_source_without_modifying_source() {
+    let fixture = TransferFixture::create("assemble-nested-work").await;
+    let work_root = fixture.root.join(".private-package-work");
+
+    assert!(matches!(
+        assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest).await,
+        Err(TransferPackageAssemblyError::WorkPathInsideSource {
+            source_root,
+            work_root: rejected,
+        }) if source_root == fixture.root && rejected == work_root
+    ));
+    assert!(
+        !work_root.exists(),
+        "rejected work must not add an undeclared object to source staging"
+    );
+    verify_staged_transfer(&fixture.root, &fixture.manifest)
+        .await
+        .expect("rejected nested work must leave source staging unchanged");
+
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn assembly_reports_a_missing_work_parent_without_creating_paths() {
+    let fixture = TransferFixture::create("assemble-missing-parent").await;
+    let missing_parent = unique_path("missing-package-parent");
+    let work_root = missing_parent.join(".private-package-work");
+
+    assert!(matches!(
+        assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest).await,
+        Err(TransferPackageAssemblyError::MissingParent(path)) if path == missing_parent
+    ));
+    assert!(
+        !missing_parent.exists(),
+        "assembly must not create a missing caller-selected parent"
+    );
+
     fixture.remove();
 }
 
@@ -435,6 +755,507 @@ async fn publication_rejects_corrupt_private_work_before_creating_destination() 
 }
 
 #[tokio::test]
+async fn recovery_reverifies_published_work_before_advancing_to_verified() {
+    let fixture = TransferFixture::create("recover-published").await;
+    let publication_root = unique_path("recover-published-root");
+    let work_root = publication_root.join(".private-package-work");
+    let destination = publication_root.join("book.kagextra");
+    let state_root = unique_path("recover-published-state");
+    std::fs::create_dir(&publication_root).expect("publication root should be created");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest)
+        .await
+        .expect("private package should assemble");
+    publish_private_transfer_package(&work_root, &destination)
+        .await
+        .expect("package fixture should publish");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::PublishedUnverified,
+    )
+    .expect("fixture should persist the post-rename boundary");
+
+    let recovered = recover_export_work_state(&state_root)
+        .await
+        .expect("published recovery should reverify and complete");
+
+    assert!(matches!(recovered, TransferRecoveryOutcome::Verified(_)));
+    assert_eq!(recovered.destination(), destination);
+    assert_eq!(recovered.state(), TransferOperationState::Verified);
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("recovered state should load")
+            .state(),
+        TransferOperationState::Verified
+    );
+    assert!(matches!(
+        recover_export_work_state(&state_root)
+            .await
+            .expect("verified recovery should be idempotent"),
+        TransferRecoveryOutcome::Verified(_)
+    ));
+
+    std::fs::write(
+        destination.join("attachments/evidence.bin"),
+        b"damaged after verified recovery",
+    )
+    .expect("verified package fixture should be damageable");
+    assert!(matches!(
+        recover_export_work_state(&state_root).await,
+        Err(TransferRecoveryError::PublishedVerification { destination: path, .. })
+            if path == destination
+    ));
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("terminal recovery state should remain readable")
+            .state(),
+        TransferOperationState::Verified,
+        "terminal durable state must never be downgraded after later package damage"
+    );
+
+    std::fs::remove_dir_all(destination).expect("published package should be removed");
+    std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn recovery_keeps_damaged_published_work_retryable_and_preserves_it() {
+    let fixture = TransferFixture::create("recover-damaged").await;
+    let publication_root = unique_path("recover-damaged-root");
+    let work_root = publication_root.join(".private-package-work");
+    let destination = publication_root.join("book.kagextra");
+    let state_root = unique_path("recover-damaged-state");
+    std::fs::create_dir(&publication_root).expect("publication root should be created");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest)
+        .await
+        .expect("private package should assemble");
+    publish_private_transfer_package(&work_root, &destination)
+        .await
+        .expect("package fixture should publish");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::PublishedUnverified,
+    )
+    .expect("fixture should persist the post-rename boundary");
+    let damaged = destination.join("attachments/evidence.bin");
+    std::fs::write(&damaged, b"damaged after publication")
+        .expect("published fixture should be damageable");
+
+    assert!(matches!(
+        recover_export_work_state(&state_root).await,
+        Err(TransferRecoveryError::PublishedVerification { destination: path, .. })
+            if path == destination
+    ));
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("failed verification state should remain readable")
+            .state(),
+        TransferOperationState::PublishedUnverified,
+        "a possibly transient verification error must remain retryable"
+    );
+    assert!(state_root.exists() && destination.exists());
+
+    std::fs::remove_dir_all(destination).expect("damaged package should be removed");
+    std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn recovery_requires_destination_parent_synchronization_before_verification() {
+    let state_root = unique_path("recover-missing-parent-state");
+    let missing_parent = unique_path("recover-missing-parent");
+    let destination = missing_parent.join("book.kagextra");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::PublishedUnverified,
+    )
+    .expect("fixture should persist the post-rename boundary");
+
+    assert!(matches!(
+        recover_export_work_state(&state_root).await,
+        Err(TransferRecoveryError::PublishedParentSynchronization {
+            destination: path,
+            parent,
+            ..
+        }) if path == destination && parent == missing_parent
+    ));
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("failed durability recovery should remain readable")
+            .state(),
+        TransferOperationState::PublishedUnverified,
+        "failed parent synchronization must never advance durable state"
+    );
+
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+}
+
+#[tokio::test]
+async fn recovery_preserves_published_work_when_a_crash_lock_remains() {
+    let fixture = TransferFixture::create("recover-crash-lock").await;
+    let publication_root = unique_path("recover-crash-lock-root");
+    let work_root = publication_root.join(".private-package-work");
+    let destination = publication_root.join("book.kagextra");
+    let state_root = unique_path("recover-crash-lock-state");
+    std::fs::create_dir(&publication_root).expect("publication root should be created");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest)
+        .await
+        .expect("private package should assemble");
+    publish_private_transfer_package(&work_root, &destination)
+        .await
+        .expect("package fixture should publish");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::PublishedUnverified,
+    )
+    .expect("fixture should persist the post-rename boundary");
+    let lock_path = state_root.join(".operation-state.lock");
+    std::fs::write(&lock_path, b"crash residue").expect("crash lock fixture should be written");
+
+    assert!(matches!(
+        recover_export_work_state(&state_root).await,
+        Err(TransferRecoveryError::VerifiedState { source, .. })
+            if matches!(&*source, TransferWorkStateError::UpdateLocked(path) if path == &lock_path)
+    ));
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("locked state should remain readable")
+            .state(),
+        TransferOperationState::PublishedUnverified
+    );
+    load_and_verify_transfer_package(&destination)
+        .await
+        .expect("crash lock must not damage the published package");
+    assert!(lock_path.exists(), "recovery must preserve crash evidence");
+
+    std::fs::remove_dir_all(destination).expect("published package should be removed");
+    std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn recovery_tolerates_and_preserves_a_crash_temporary_state_file() {
+    let fixture = TransferFixture::create("recover-crash-temporary-state").await;
+    let publication_root = unique_path("recover-crash-temporary-state-root");
+    let work_root = publication_root.join(".private-package-work");
+    let destination = publication_root.join("book.kagextra");
+    let state_root = unique_path("recover-crash-temporary-state");
+    std::fs::create_dir(&publication_root).expect("publication root should be created");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest)
+        .await
+        .expect("private package should assemble");
+    publish_private_transfer_package(&work_root, &destination)
+        .await
+        .expect("package fixture should publish");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::PublishedUnverified,
+    )
+    .expect("fixture should persist the post-rename boundary");
+    let temporary_path = state_root.join(".operation-state-4242-123456789-0.tmp");
+    std::fs::write(&temporary_path, b"partial state from interrupted writer")
+        .expect("crash temporary file fixture should be written");
+
+    let recovered = recover_export_work_state(&state_root)
+        .await
+        .expect("unambiguous published recovery should ignore unrelated crash residue");
+
+    assert!(matches!(recovered, TransferRecoveryOutcome::Verified(_)));
+    assert_eq!(recovered.destination(), destination);
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("recovered state should remain readable")
+            .state(),
+        TransferOperationState::Verified
+    );
+    assert_eq!(
+        std::fs::read(&temporary_path).expect("crash evidence should remain readable"),
+        b"partial state from interrupted writer",
+        "recovery must not silently delete ambiguous crash evidence"
+    );
+
+    std::fs::remove_dir_all(destination).expect("published package should be removed");
+    std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn concurrent_recovery_converges_on_one_verified_terminal_state() {
+    let fixture = TransferFixture::create("concurrent-recovery").await;
+    let publication_root = unique_path("concurrent-recovery-root");
+    let work_root = publication_root.join(".private-package-work");
+    let destination = publication_root.join("book.kagextra");
+    let state_root = unique_path("concurrent-recovery-state");
+    std::fs::create_dir(&publication_root).expect("publication root should be created");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    assemble_private_transfer_package(&fixture.root, &work_root, &fixture.manifest)
+        .await
+        .expect("private package should assemble");
+    publish_private_transfer_package(&work_root, &destination)
+        .await
+        .expect("package fixture should publish");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::PublishedUnverified,
+    )
+    .expect("fixture should persist the post-rename boundary");
+
+    let (left, right) = tokio::join!(
+        recover_export_work_state(&state_root),
+        recover_export_work_state(&state_root),
+    );
+
+    let mut verified = 0;
+    for outcome in [left, right] {
+        match outcome {
+            Ok(TransferRecoveryOutcome::Verified(package)) => {
+                verified += 1;
+                assert_eq!(package.destination(), destination);
+            }
+            Err(TransferRecoveryError::VerifiedState { source, .. })
+                if matches!(
+                    &*source,
+                    TransferWorkStateError::UpdateLocked(_)
+                        | TransferWorkStateError::StaleState {
+                            expected: TransferOperationState::PublishedUnverified,
+                            actual: TransferOperationState::Verified,
+                        }
+                ) => {}
+            other => panic!("unexpected concurrent recovery outcome: {other:?}"),
+        }
+    }
+    assert!(verified >= 1, "at least one recovery caller must complete");
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("concurrent recovery state should remain readable")
+            .state(),
+        TransferOperationState::Verified
+    );
+    assert!(matches!(
+        recover_export_work_state(&state_root)
+            .await
+            .expect("a retry after concurrent recovery should be idempotent"),
+        TransferRecoveryOutcome::Verified(_)
+    ));
+    assert_eq!(
+        std::fs::read_dir(&state_root)
+            .expect("state root should remain readable")
+            .count(),
+        1,
+        "successful competing recovery must not leave a lock or temporary state file"
+    );
+
+    std::fs::remove_dir_all(destination).expect("published package should be removed");
+    std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn recovery_classifies_failed_state_without_touching_a_competing_destination() {
+    let state_root = unique_path("recover-failed-state");
+    let destination = unique_path("recover-failed-destination.kagextra");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    transition_transfer_work_state(
+        &state_root,
+        TransferOperationState::Working,
+        TransferOperationState::Failed,
+    )
+    .expect("working state should become failed");
+    std::fs::create_dir(&destination).expect("competing destination should be created");
+    let sentinel = destination.join("sentinel");
+    std::fs::write(&sentinel, b"unrelated destination")
+        .expect("competing destination sentinel should be written");
+
+    let recovered = recover_export_work_state(&state_root)
+        .await
+        .expect("failed state should classify without destination inspection");
+    assert!(matches!(recovered, TransferRecoveryOutcome::Failed { .. }));
+    assert_eq!(recovered.state(), TransferOperationState::Failed);
+    assert_eq!(
+        std::fs::read(&sentinel).expect("competing destination should remain readable"),
+        b"unrelated destination"
+    );
+
+    std::fs::remove_dir_all(destination).expect("competing destination should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+}
+
+#[tokio::test]
+async fn recovery_never_adopts_a_destination_that_appears_while_working() {
+    let state_root = unique_path("recover-working-state");
+    let destination = unique_path("recover-working-destination.kagextra");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+
+    let private = recover_export_work_state(&state_root)
+        .await
+        .expect("absent destination should classify as private work");
+    assert!(matches!(
+        private,
+        TransferRecoveryOutcome::PrivateWorking { .. }
+    ));
+
+    std::fs::create_dir(&destination).expect("racing destination should be created");
+    std::fs::write(destination.join("sentinel"), b"not this operation")
+        .expect("racing destination sentinel should be written");
+    let collided = recover_export_work_state(&state_root)
+        .await
+        .expect("working collision should be classified without adoption");
+    assert!(matches!(
+        collided,
+        TransferRecoveryOutcome::DestinationPresentWhileWorking { .. }
+    ));
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("working state should remain readable")
+            .state(),
+        TransferOperationState::Working
+    );
+    assert_eq!(
+        std::fs::read(destination.join("sentinel"))
+            .expect("racing destination should remain untouched"),
+        b"not this operation"
+    );
+
+    std::fs::remove_dir_all(destination).expect("racing destination should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_never_follows_a_working_destination_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let state_root = unique_path("recover-working-symlink-state");
+    let destination = unique_path("recover-working-symlink-destination.kagextra");
+    let external = unique_path("recover-working-symlink-external");
+    let sentinel = external.join("sentinel");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("working recovery state should be created");
+    std::fs::create_dir(&external).expect("external destination should be created");
+    std::fs::write(&sentinel, b"outside recovery ownership")
+        .expect("external sentinel should be written");
+    symlink(&external, &destination).expect("racing destination symlink should be created");
+
+    let recovered = recover_export_work_state(&state_root)
+        .await
+        .expect("working destination symlink should be classified without adoption");
+
+    assert!(matches!(
+        recovered,
+        TransferRecoveryOutcome::DestinationPresentWhileWorking { .. }
+    ));
+    assert_eq!(recovered.destination(), destination);
+    assert_eq!(
+        load_transfer_work_state(&state_root)
+            .expect("working state should remain readable")
+            .state(),
+        TransferOperationState::Working
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("external sentinel should remain readable"),
+        b"outside recovery ownership"
+    );
+    assert!(
+        std::fs::symlink_metadata(&destination)
+            .expect("destination symlink should remain inspectable")
+            .file_type()
+            .is_symlink(),
+        "recovery must preserve the competing symlink as evidence"
+    );
+
+    std::fs::remove_file(destination).expect("destination symlink should be removed");
+    std::fs::remove_dir_all(external).expect("external destination should be removed");
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+}
+
+#[tokio::test]
+async fn working_recovery_is_read_only_idempotent_and_preserves_unicode_destination() {
+    let state_root = unique_path("recover-working-unicode-state");
+    let destination_parent = unique_path("recover-working-unicode-destination");
+    let destination = destination_parent.join("帳簿-📒-2026.kagextra");
+    create_private_test_directory(&state_root);
+    create_export_work_state(&state_root, &destination)
+        .expect("Unicode recovery state should be created");
+    let state_path = state_root.join(TRANSFER_WORK_STATE_FILE_NAME);
+    let partial_database = state_root.join(STAGED_DATABASE_PATH);
+    let interrupted_update = state_root.join(".operation-state-4242-123456789-0.tmp");
+    std::fs::write(&partial_database, b"partial snapshot")
+        .expect("partial snapshot crash fixture should be written");
+    std::fs::write(&interrupted_update, b"partial state update")
+        .expect("interrupted state update fixture should be written");
+    let state_before = std::fs::read(&state_path).expect("working state bytes should be readable");
+    let mut entries_before = std::fs::read_dir(&state_root)
+        .expect("state root should be readable")
+        .map(|entry| entry.expect("state entry should be readable").path())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+
+    for _ in 0..3 {
+        let recovered = recover_export_work_state(&state_root)
+            .await
+            .expect("absent Unicode destination should remain private work");
+        assert!(matches!(
+            recovered,
+            TransferRecoveryOutcome::PrivateWorking { .. }
+        ));
+        assert_eq!(recovered.destination(), destination);
+        assert_eq!(recovered.state(), TransferOperationState::Working);
+    }
+
+    assert_eq!(
+        std::fs::read(&state_path).expect("working state bytes should remain readable"),
+        state_before,
+        "read-only recovery must not rewrite a working state record"
+    );
+    assert_eq!(
+        {
+            let mut entries = std::fs::read_dir(&state_root)
+                .expect("state root should remain readable")
+                .map(|entry| entry.expect("state entry should be readable").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        },
+        entries_before,
+        "idempotent classification must neither create nor delete crash evidence"
+    );
+
+    std::fs::remove_dir_all(state_root).expect("state root should be removed");
+}
+
+#[tokio::test]
 async fn staged_export_runs_the_complete_safe_publication_workflow() {
     let fixture = TransferFixture::create("orchestrated-export").await;
     let publication_root = unique_path("orchestrated-export-root");
@@ -457,6 +1278,49 @@ async fn staged_export_runs_the_complete_safe_publication_workflow() {
         Vec::<PathBuf>::new(),
         "successful atomic publication must not leave private work behind"
     );
+
+    std::fs::remove_dir_all(destination).expect("published package should be removed");
+    std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn retrying_a_successful_staged_export_is_non_destructive() {
+    let fixture = TransferFixture::create("orchestrated-idempotent-retry").await;
+    let publication_root = unique_path("orchestrated-idempotent-retry-root");
+    let destination = publication_root.join("book.kagextra");
+    std::fs::create_dir(&publication_root).expect("publication root should be created");
+
+    export_staged_transfer_package(&fixture.root, &destination, &fixture.manifest)
+        .await
+        .expect("first export should publish and verify");
+    let manifest_before = std::fs::read(destination.join(TRANSFER_MANIFEST_FILE_NAME))
+        .expect("published manifest should be readable");
+    let attachment_before = std::fs::read(destination.join("attachments/evidence.bin"))
+        .expect("published attachment should be readable");
+
+    assert!(matches!(
+        export_staged_transfer_package(&fixture.root, &destination, &fixture.manifest).await,
+        Err(TransferExportError::DestinationExists(path)) if path == destination
+    ));
+    assert_eq!(
+        std::fs::read(destination.join(TRANSFER_MANIFEST_FILE_NAME))
+            .expect("published manifest should remain readable"),
+        manifest_before
+    );
+    assert_eq!(
+        std::fs::read(destination.join("attachments/evidence.bin"))
+            .expect("published attachment should remain readable"),
+        attachment_before
+    );
+    assert_eq!(
+        private_export_work_paths(&publication_root),
+        Vec::<PathBuf>::new(),
+        "known retry conflicts must not allocate private export work"
+    );
+    load_and_verify_transfer_package(&destination)
+        .await
+        .expect("original verified package should survive the retry");
 
     std::fs::remove_dir_all(destination).expect("published package should be removed");
     std::fs::remove_dir(publication_root).expect("publication root should be removed");
@@ -489,6 +1353,33 @@ async fn staged_export_rejects_an_existing_destination_before_creating_work() {
 
     std::fs::remove_dir_all(destination).expect("existing destination should be removed");
     std::fs::remove_dir(publication_root).expect("publication root should be removed");
+    fixture.remove();
+}
+
+#[tokio::test]
+async fn staged_export_rejects_a_destination_inside_source_staging() {
+    let fixture = TransferFixture::create("orchestrated-nested-destination").await;
+    let destination = fixture.root.join("nested/book.kagextra");
+    std::fs::create_dir(fixture.root.join("nested"))
+        .expect("nested destination parent fixture should be created");
+
+    let error = export_staged_transfer_package(&fixture.root, &destination, &fixture.manifest)
+        .await
+        .expect_err("destination inside source must be rejected");
+    assert!(matches!(
+        error,
+        TransferExportError::Assembly { source, .. }
+            if matches!(*source, TransferPackageAssemblyError::WorkPathInsideSource { .. })
+    ));
+    assert!(!destination.exists());
+    assert_eq!(
+        private_export_work_paths(&fixture.root.join("nested")),
+        Vec::<PathBuf>::new(),
+        "rejected nested destination must not create private package work"
+    );
+
+    std::fs::remove_dir(fixture.root.join("nested"))
+        .expect("nested destination parent should be removed");
     fixture.remove();
 }
 
@@ -613,9 +1504,21 @@ async fn live_objects_prepare_one_verified_private_staging_tree() {
             .expect("staged attachment should be readable"),
         b"immutable attachment bytes"
     );
+    std::fs::write(&source_attachment, b"changed after snapshot preparation")
+        .expect("source attachment should remain independently mutable");
+    sqlx::query("CREATE TABLE after_snapshot_marker (id INTEGER PRIMARY KEY) STRICT")
+        .execute(&source_pool)
+        .await
+        .expect("isolated source database should remain independently mutable");
     verify_staged_transfer(&staging_root, prepared.manifest())
         .await
-        .expect("prepared staging should independently verify");
+        .expect("prepared staging should not depend on later source changes");
+    assert_eq!(
+        std::fs::read(staging_root.join("attachments/receipts/2026/evidence.bin"))
+            .expect("staged attachment should remain readable"),
+        b"immutable attachment bytes",
+        "staging must retain the bytes selected at snapshot preparation"
+    );
     assert!(
         source_attachment.exists(),
         "staging preparation must preserve source attachments"
@@ -825,6 +1728,35 @@ async fn live_book_export_rejects_known_destination_before_snapshot_work() {
 }
 
 #[tokio::test]
+async fn live_book_export_rejects_destination_inside_private_work_parent() {
+    let source_database_path = unique_path("live-overlap-source.sqlite3");
+    let source_pool = open_database(&source_database_path)
+        .await
+        .expect("isolated source database should open");
+    let local_work_parent = unique_path("live-overlap-work");
+    let destination = local_work_parent.join("book.kagextra");
+    std::fs::create_dir(&local_work_parent).expect("local work parent should be created");
+
+    assert!(matches!(
+        export_live_book_snapshot(&source_pool, &local_work_parent, &[], &destination).await,
+        Err(LiveBookExportError::DestinationInsideWorkParent {
+            work_parent,
+            destination: rejected,
+        }) if work_parent == local_work_parent && rejected == destination
+    ));
+    assert_eq!(
+        private_snapshot_work_paths(&local_work_parent),
+        Vec::<PathBuf>::new(),
+        "overlapping destination must be rejected before snapshot work"
+    );
+    assert!(!destination.exists());
+
+    source_pool.close().await;
+    remove_sqlite_files(&source_database_path);
+    std::fs::remove_dir(local_work_parent).expect("local work parent should be removed");
+}
+
+#[tokio::test]
 async fn live_book_export_preserves_private_staging_after_preparation_failure() {
     let source_database_path = unique_path("live-failure-source.sqlite3");
     let source_pool = open_database(&source_database_path)
@@ -866,6 +1798,11 @@ async fn live_book_export_preserves_private_staging_after_preparation_failure() 
         staging_root.join(STAGED_DATABASE_PATH).exists(),
         "successful SQLite snapshot work must not be hidden by a later attachment failure"
     );
+    let persisted = load_transfer_work_state(&staging_root)
+        .expect("failed preparation should retain its durable recovery record");
+    assert_eq!(persisted.destination(), destination);
+    assert_eq!(persisted.state(), TransferOperationState::Working);
+    assert!(staging_root.join(TRANSFER_WORK_STATE_FILE_NAME).is_file());
     assert!(!destination.exists(), "failed preparation must not publish");
     assert_eq!(
         std::fs::read(&source_attachment).expect("source attachment should remain readable"),
@@ -963,7 +1900,9 @@ impl TransferFixture {
 }
 
 fn unique_path(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    let temporary_root = std::fs::canonicalize(std::env::temp_dir())
+        .expect("system temporary directory should resolve to a real path");
+    temporary_root.join(format!(
         "kAccounting-Extra-01-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -971,6 +1910,17 @@ fn unique_path(label: &str) -> PathBuf {
             .expect("clock should be after Unix epoch")
             .as_nanos()
     ))
+}
+
+fn create_private_test_directory(path: &Path) {
+    std::fs::create_dir(path).expect("private test directory should be created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private test directory should be owner-only");
+    }
 }
 
 fn private_export_work_paths(parent: &Path) -> Vec<PathBuf> {

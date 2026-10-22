@@ -28,6 +28,11 @@ pub const CURRENT_TRANSFER_MANIFEST_VERSION: u32 = 1;
 pub struct ContentDigest([u8; SHA256_BYTE_LENGTH]);
 
 impl ContentDigest {
+    /// Constructs a digest already computed by a SHA-256 streaming implementation.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Returns the lowercase hexadecimal representation used by manifests and
     /// content-addressed paths.
     pub fn to_hex(self) -> String {
@@ -340,8 +345,104 @@ impl StoredObjectDescriptor {
 
 /// Hashes an existing file without modifying it.
 pub fn describe_file(path: impl AsRef<Path>) -> io::Result<StoredObjectDescriptor> {
-    let mut file = std::fs::File::open(path)?;
-    describe_reader(&mut file)
+    let path = path.as_ref();
+    let mut file = open_regular_file_without_symlink(path)?;
+    let descriptor = describe_reader(&mut file)?;
+    ensure_path_still_names_open_file(path, &file)?;
+    Ok(descriptor)
+}
+
+/// Opens a path only when it is a regular file before and after opening.
+/// On Unix (including the supported macOS target), device and inode checks
+/// also reject a name that was substituted during the check/open sequence.
+pub(crate) fn open_regular_file_without_symlink(path: &Path) -> io::Result<std::fs::File> {
+    let before = std::fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stored object must be a regular non-symlink file",
+        ));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    let after = std::fs::symlink_metadata(path)?;
+    if after.file_type().is_symlink() || !after.is_file() || !opened.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stored object path changed while it was being opened",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        if !same_file_identity(&before, &opened) || !same_file_identity(&after, &opened) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stored object path changed while it was being opened",
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
+/// Re-checks the pathname after the complete read. Holding the file open keeps
+/// the bytes readable if the name is replaced, but callers verifying a stored
+/// object need the stronger guarantee that the verified name still denotes
+/// that opened file when verification returns.
+pub(crate) fn ensure_path_still_names_open_file(
+    path: &Path,
+    file: &std::fs::File,
+) -> io::Result<()> {
+    let opened = file.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink() || !current.is_file() || !opened.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stored object path changed while it was being read",
+        ));
+    }
+
+    #[cfg(unix)]
+    if !same_file_identity(&current, &opened) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stored object path changed while it was being read",
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+pub(crate) fn ensure_directory_still_matches(
+    path: &Path,
+    expected: &std::fs::Metadata,
+) -> io::Result<()> {
+    let current = std::fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink() || !current.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage destination parent changed during the operation",
+        ));
+    }
+
+    #[cfg(unix)]
+    if !same_file_identity(&current, expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage destination parent changed during the operation",
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -485,6 +586,31 @@ pub fn publish_private_directory_noreplace(
         }
     }
 
+    let current_source = std::fs::symlink_metadata(source).map_err(|source_error| {
+        LocalDirectoryPublishError::Io {
+            operation: "rechecking source",
+            path: source.to_path_buf(),
+            source: source_error,
+        }
+    })?;
+    if !current_source.is_dir() || current_source.file_type().is_symlink() || {
+        #[cfg(unix)]
+        {
+            !same_file_identity(&current_source, &source_metadata)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    } {
+        return Err(LocalDirectoryPublishError::UnsafeSource(
+            source.to_path_buf(),
+        ));
+    }
+
+    ensure_directory_still_matches(parent, &parent_metadata)
+        .map_err(|_| LocalDirectoryPublishError::MissingParent(parent.to_path_buf()))?;
+
     renamore::rename_exclusive(source, destination).map_err(|source| {
         if source.kind() == io::ErrorKind::AlreadyExists {
             LocalDirectoryPublishError::DestinationExists(destination.to_path_buf())
@@ -529,9 +655,9 @@ pub fn verify_file(
 /// Copies and publishes one verified object to local storage without replacing
 /// any existing file or symlink.
 ///
-/// The temporary work file lives beside the destination, so the final hard-link
-/// publication is atomic on supported local macOS filesystems. This is not the
-/// removable-drive `.kagextra` publication mechanism.
+/// The temporary work file lives beside the destination, so the final exclusive
+/// rename is atomic without leaving a second mutable hard-link name behind.
+/// This is not the removable-drive `.kagextra` publication mechanism.
 pub fn publish_verified_local_copy(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -539,7 +665,6 @@ pub fn publish_verified_local_copy(
 ) -> Result<LocalObjectPublishOutcome, LocalObjectPublishError> {
     let source = source.as_ref();
     let destination = destination.as_ref();
-    ensure_destination_absent(destination)?;
 
     let parent = destination
         .parent()
@@ -550,6 +675,7 @@ pub fn publish_verified_local_copy(
     if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
         return Err(LocalObjectPublishError::MissingParent(parent.to_path_buf()));
     }
+    ensure_destination_absent(destination)?;
 
     let source_metadata =
         std::fs::symlink_metadata(source).map_err(|source_error| LocalObjectPublishError::Io {
@@ -563,7 +689,13 @@ pub fn publish_verified_local_copy(
 
     let work_directory = create_private_object_directory(parent)?;
     let work_file = work_directory.join("object");
-    let result = copy_verify_and_publish(source, &work_file, destination, expected);
+    let result = ensure_directory_still_matches(parent, &parent_metadata)
+        .map_err(|source| LocalObjectPublishError::Io {
+            operation: "rechecking destination parent",
+            path: parent.to_path_buf(),
+            source,
+        })
+        .and_then(|()| copy_verify_and_publish(source, &work_file, destination, expected));
     let cleanup = cleanup_object_work(&work_file, &work_directory);
 
     match (result, cleanup) {
@@ -638,12 +770,17 @@ fn copy_verify_and_publish(
     destination: &Path,
     expected: StoredObjectDescriptor,
 ) -> Result<(), LocalObjectPublishError> {
-    let mut source_file =
-        std::fs::File::open(source).map_err(|source_error| LocalObjectPublishError::Io {
-            operation: "opening source",
-            path: source.to_path_buf(),
-            source: source_error,
-        })?;
+    let mut source_file = open_regular_file_without_symlink(source).map_err(|source_error| {
+        if source_error.kind() == io::ErrorKind::InvalidInput {
+            LocalObjectPublishError::UnsafeSource(source.to_path_buf())
+        } else {
+            LocalObjectPublishError::Io {
+                operation: "opening source",
+                path: source.to_path_buf(),
+                source: source_error,
+            }
+        }
+    })?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -672,7 +809,7 @@ fn copy_verify_and_publish(
     drop(output);
 
     verify_file(work_file, expected)?;
-    std::fs::hard_link(work_file, destination).map_err(|source| {
+    renamore::rename_exclusive(work_file, destination).map_err(|source| {
         if source.kind() == io::ErrorKind::AlreadyExists {
             LocalObjectPublishError::DestinationExists(destination.to_path_buf())
         } else {
@@ -686,12 +823,22 @@ fn copy_verify_and_publish(
 }
 
 fn cleanup_object_work(file: &Path, directory: &Path) -> Result<(), LocalObjectCleanupWarning> {
-    if file.exists() {
-        std::fs::remove_file(file).map_err(|source| LocalObjectCleanupWarning {
-            operation: "removing private object file",
-            path: file.to_path_buf(),
-            source,
-        })?;
+    match std::fs::symlink_metadata(file) {
+        Ok(_) => {
+            std::fs::remove_file(file).map_err(|source| LocalObjectCleanupWarning {
+                operation: "removing private object file",
+                path: file.to_path_buf(),
+                source,
+            })?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(LocalObjectCleanupWarning {
+                operation: "checking private object file during cleanup",
+                path: file.to_path_buf(),
+                source,
+            });
+        }
     }
     std::fs::remove_dir(directory).map_err(|source| LocalObjectCleanupWarning {
         operation: "removing private object directory",

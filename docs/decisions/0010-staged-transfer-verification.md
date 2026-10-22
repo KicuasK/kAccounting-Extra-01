@@ -12,8 +12,9 @@ staging directory and verified read-only:
    the manifest's SHA-256 and exact byte length;
 3. the database must independently pass the existing application identity,
    migration, schema, foreign-key, physical, and accounting-semantic audit;
-4. every declared attachment must be a regular non-symlink file and match its
-   manifest descriptor.
+4. every intermediate directory on a declared attachment path must be a real
+   non-symlink directory, and every declared attachment must be a regular
+   non-symlink file matching its manifest descriptor.
 
 Verification never creates a missing object, migrates a candidate, or publishes
 it as a live book. Import replacement and rollback remain a separate workflow.

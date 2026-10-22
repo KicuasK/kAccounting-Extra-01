@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -127,6 +127,13 @@ pub enum TransferPackageVerificationError {
 pub enum TransferPackageAssemblyError {
     #[error("source staging verification failed: {0}")]
     Source(#[from] TransferVerificationError),
+    #[error(
+        "private package work path {work_root} must not be inside source staging {source_root}"
+    )]
+    WorkPathInsideSource {
+        source_root: PathBuf,
+        work_root: PathBuf,
+    },
     #[error("private package work path already exists: {0}")]
     WorkPathExists(PathBuf),
     #[error("private package work parent is missing or unsafe: {0}")]
@@ -154,6 +161,8 @@ pub enum TransferPackageAssemblyError {
     Manifest(#[from] TransferManifestJsonError),
     #[error("assembled private package failed complete verification: {0}")]
     Verification(#[from] TransferPackageVerificationError),
+    #[error("assembled private package manifest differs from the selected export manifest")]
+    ManifestMismatch,
 }
 
 #[derive(Debug, Error)]
@@ -161,6 +170,8 @@ pub enum TransferPackageAssemblyError {
 pub enum TransferPackagePublishError {
     #[error("private package verification failed: {0}")]
     PrivateVerification(#[source] Box<TransferPackageVerificationError>),
+    #[error("private package manifest at {work_root} differs from the selected export manifest")]
+    PrivateManifestMismatch { work_root: PathBuf },
     #[error("failed to synchronize transfer package path {path}: {source}")]
     Synchronization {
         path: PathBuf,
@@ -190,6 +201,10 @@ pub enum TransferPackagePublishError {
         #[source]
         source: Box<TransferPackageVerificationError>,
     },
+    #[error(
+        "package was published at {destination}, but its manifest differs from the verified private package"
+    )]
+    PublishedManifestMismatch { destination: PathBuf },
     #[error("package verified at {destination}, but durable verified state failed: {source}")]
     VerifiedState {
         destination: PathBuf,
@@ -362,6 +377,13 @@ pub struct TransferWorkCleanupWarning {
 pub enum LiveBookExportError {
     #[error("transfer export destination preflight failed: {0}")]
     Destination(#[source] TransferExportError),
+    #[error(
+        "transfer export destination {destination} must not be inside local work parent {work_parent}"
+    )]
+    DestinationInsideWorkParent {
+        work_parent: PathBuf,
+        destination: PathBuf,
+    },
     #[error("local transfer work parent is missing or unsafe: {0}")]
     MissingWorkParent(PathBuf),
     #[error("failed to inspect local transfer work parent {path}: {source}")]
@@ -444,6 +466,81 @@ pub struct VerifiedTransferPackage {
     work_state_cleanup_warnings: Vec<TransferWorkStateCleanupWarning>,
 }
 
+#[derive(Debug)]
+/// Conservative restart classification for one durable export work root.
+///
+/// A destination that appears while the durable state is still `working` is
+/// deliberately not adopted: it may have been created by a competing export.
+/// Only a persisted `published_unverified` state proves that this operation
+/// completed its exclusive rename and may resume public verification.
+pub enum TransferRecoveryOutcome {
+    PrivateWorking { destination: PathBuf },
+    DestinationPresentWhileWorking { destination: PathBuf },
+    Verified(VerifiedTransferPackage),
+    Failed { destination: PathBuf },
+}
+
+impl TransferRecoveryOutcome {
+    pub fn state(&self) -> TransferOperationState {
+        match self {
+            Self::PrivateWorking { .. } | Self::DestinationPresentWhileWorking { .. } => {
+                TransferOperationState::Working
+            }
+            Self::Verified(_) => TransferOperationState::Verified,
+            Self::Failed { .. } => TransferOperationState::Failed,
+        }
+    }
+
+    pub fn destination(&self) -> &Path {
+        match self {
+            Self::PrivateWorking { destination }
+            | Self::DestinationPresentWhileWorking { destination }
+            | Self::Failed { destination } => destination,
+            Self::Verified(package) => package.destination(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+/// Durable export work could not be classified or safely resumed.
+pub enum TransferRecoveryError {
+    #[error("invalid durable transfer work state at {state_root}: {source}")]
+    WorkState {
+        state_root: PathBuf,
+        #[source]
+        source: Box<TransferWorkStateError>,
+    },
+    #[error("failed to inspect recovered export destination {path}: {source}")]
+    InspectDestination {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("recovered published package at {destination} failed verification: {source}")]
+    PublishedVerification {
+        destination: PathBuf,
+        #[source]
+        source: Box<TransferPackageVerificationError>,
+    },
+    #[error(
+        "recovered package was published at {destination}, but synchronizing its parent {parent} failed: {source}"
+    )]
+    PublishedParentSynchronization {
+        destination: PathBuf,
+        parent: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "verified recovered package at {destination}, but durable state update failed: {source}"
+    )]
+    VerifiedState {
+        destination: PathBuf,
+        #[source]
+        source: Box<TransferWorkStateError>,
+    },
+}
+
 impl VerifiedTransferPackage {
     pub fn destination(&self) -> &Path {
         &self.destination
@@ -460,6 +557,98 @@ impl VerifiedTransferPackage {
     pub fn work_state_cleanup_warnings(&self) -> &[TransferWorkStateCleanupWarning] {
         &self.work_state_cleanup_warnings
     }
+}
+
+/// Classifies durable private export work after interruption and resumes only
+/// the unambiguous post-publication verification step.
+///
+/// `working` remains private when the destination is absent. If a destination
+/// exists while the record is still `working`, no state is changed because the
+/// destination might belong to a racing publisher. A persisted
+/// `published_unverified` record is reverified and advanced atomically to
+/// `verified`; verification failure leaves it retryable and preserves all
+/// paths. An already verified destination is independently checked again
+/// before being returned.
+pub async fn recover_export_work_state(
+    state_root: impl AsRef<Path>,
+) -> Result<TransferRecoveryOutcome, TransferRecoveryError> {
+    let state_root = state_root.as_ref();
+    let persisted = load_transfer_work_state(state_root).map_err(|source| {
+        TransferRecoveryError::WorkState {
+            state_root: state_root.to_path_buf(),
+            source: Box::new(source),
+        }
+    })?;
+    let destination = persisted.destination().to_path_buf();
+
+    match persisted.state() {
+        TransferOperationState::Working => match std::fs::symlink_metadata(&destination) {
+            Ok(_) => Ok(TransferRecoveryOutcome::DestinationPresentWhileWorking { destination }),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(TransferRecoveryOutcome::PrivateWorking { destination })
+            }
+            Err(source) => Err(TransferRecoveryError::InspectDestination {
+                path: destination,
+                source,
+            }),
+        },
+        TransferOperationState::PublishedUnverified => {
+            synchronize_recovered_destination_parent(&destination)?;
+            let manifest = load_and_verify_transfer_package(&destination)
+                .await
+                .map_err(|source| TransferRecoveryError::PublishedVerification {
+                    destination: destination.clone(),
+                    source: Box::new(source),
+                })?;
+            let outcome = transition_transfer_work_state(
+                state_root,
+                TransferOperationState::PublishedUnverified,
+                TransferOperationState::Verified,
+            )
+            .map_err(|source| TransferRecoveryError::VerifiedState {
+                destination: destination.clone(),
+                source: Box::new(source),
+            })?;
+            let work_state_cleanup_warnings = outcome.into_cleanup_warning().into_iter().collect();
+            Ok(TransferRecoveryOutcome::Verified(VerifiedTransferPackage {
+                destination,
+                manifest,
+                work_state_cleanup_warnings,
+            }))
+        }
+        TransferOperationState::Verified => {
+            let manifest = load_and_verify_transfer_package(&destination)
+                .await
+                .map_err(|source| TransferRecoveryError::PublishedVerification {
+                    destination: destination.clone(),
+                    source: Box::new(source),
+                })?;
+            Ok(TransferRecoveryOutcome::Verified(VerifiedTransferPackage {
+                destination,
+                manifest,
+                work_state_cleanup_warnings: Vec::new(),
+            }))
+        }
+        TransferOperationState::Failed => Ok(TransferRecoveryOutcome::Failed { destination }),
+    }
+}
+
+fn synchronize_recovered_destination_parent(
+    destination: &Path,
+) -> Result<(), TransferRecoveryError> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(
+            |source| TransferRecoveryError::PublishedParentSynchronization {
+                destination: destination.to_path_buf(),
+                parent: parent.to_path_buf(),
+                source,
+            },
+        )
 }
 
 /// Creates a verified private export staging tree from one SQLite point-in-time
@@ -481,6 +670,14 @@ pub async fn prepare_transfer_staging(
 ) -> Result<PreparedTransferStaging, TransferStagingError> {
     let staging_root = staging_root.as_ref();
     create_private_staging_root(staging_root)?;
+    prepare_transfer_staging_in_created_root(pool, staging_root, attachments).await
+}
+
+async fn prepare_transfer_staging_in_created_root(
+    pool: &SqlitePool,
+    staging_root: &Path,
+    attachments: &[TransferAttachmentSource],
+) -> Result<PreparedTransferStaging, TransferStagingError> {
     let attachments_root = staging_root.join("attachments");
     create_staging_directory(&attachments_root, "creating staging attachment directory")?;
 
@@ -566,6 +763,7 @@ pub async fn export_live_book_snapshot(
             local_work_parent.to_path_buf(),
         ));
     }
+    reject_destination_inside_work_parent(local_work_parent, destination)?;
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -580,8 +778,8 @@ pub async fn export_live_book_snapshot(
             ".kAccounting-Extra-01-snapshot-{}-{nonce}-{attempt}.work",
             std::process::id()
         ));
-        let prepared = match prepare_transfer_staging(pool, &staging_root, attachments).await {
-            Ok(prepared) => prepared,
+        match create_private_staging_root(&staging_root) {
+            Ok(()) => {}
             Err(TransferStagingError::StagingPathExists(_)) => continue,
             Err(source) => {
                 return Err(LiveBookExportError::Preparation {
@@ -589,13 +787,19 @@ pub async fn export_live_book_snapshot(
                     source: Box::new(source),
                 });
             }
-        };
+        }
         create_export_work_state(&staging_root, destination).map_err(|source| {
             LiveBookExportError::WorkState {
                 staging_root: staging_root.clone(),
                 source: Box::new(source),
             }
         })?;
+        let prepared = prepare_transfer_staging_in_created_root(pool, &staging_root, attachments)
+            .await
+            .map_err(|source| LiveBookExportError::Preparation {
+                staging_root: staging_root.clone(),
+                source: Box::new(source),
+            })?;
 
         let package = export_staged_transfer_package_with_work_state(
             prepared.root(),
@@ -626,6 +830,36 @@ pub async fn export_live_book_snapshot(
     Err(LiveBookExportError::WorkPathExhausted(
         local_work_parent.to_path_buf(),
     ))
+}
+
+fn reject_destination_inside_work_parent(
+    local_work_parent: &Path,
+    destination: &Path,
+) -> Result<(), LiveBookExportError> {
+    let canonical_work_parent = std::fs::canonicalize(local_work_parent).map_err(|source| {
+        LiveBookExportError::InspectWorkParent {
+            path: local_work_parent.to_path_buf(),
+            source,
+        }
+    })?;
+    let destination_parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_destination_parent =
+        std::fs::canonicalize(destination_parent).map_err(|source| {
+            LiveBookExportError::Destination(TransferExportError::InspectParent {
+                path: destination_parent.to_path_buf(),
+                source,
+            })
+        })?;
+    if canonical_destination_parent.starts_with(canonical_work_parent) {
+        return Err(LiveBookExportError::DestinationInsideWorkParent {
+            work_parent: local_work_parent.to_path_buf(),
+            destination: destination.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn create_private_staging_root(root: &Path) -> Result<(), TransferStagingError> {
@@ -815,6 +1049,7 @@ async fn export_staged_transfer_package_internal(
                 return publish_private_transfer_package_internal(
                     &work_root,
                     destination,
+                    Some(manifest),
                     state_root,
                 )
                 .await
@@ -887,6 +1122,7 @@ pub async fn assemble_private_transfer_package(
     let source_root = source_root.as_ref();
     let work_root = work_root.as_ref();
     verify_staged_transfer(source_root, manifest).await?;
+    reject_work_path_inside_source(source_root, work_root)?;
     create_private_package_root(work_root)?;
 
     let attachments_root = work_root.join("attachments");
@@ -912,7 +1148,43 @@ pub async fn assemble_private_transfer_package(
 
     write_private_manifest(work_root, manifest)?;
     let assembled = load_and_verify_transfer_package(work_root).await?;
-    debug_assert_eq!(&assembled, manifest);
+    if &assembled != manifest {
+        return Err(TransferPackageAssemblyError::ManifestMismatch);
+    }
+    Ok(())
+}
+
+fn reject_work_path_inside_source(
+    source_root: &Path,
+    work_root: &Path,
+) -> Result<(), TransferPackageAssemblyError> {
+    let canonical_source =
+        std::fs::canonicalize(source_root).map_err(|source| TransferPackageAssemblyError::Io {
+            operation: "resolving source staging root",
+            path: source_root.to_path_buf(),
+            source,
+        })?;
+    let work_parent = work_root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_work_parent = std::fs::canonicalize(work_parent).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            TransferPackageAssemblyError::MissingParent(work_parent.to_path_buf())
+        } else {
+            TransferPackageAssemblyError::Io {
+                operation: "resolving private package work parent",
+                path: work_parent.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    if canonical_work_parent.starts_with(&canonical_source) {
+        return Err(TransferPackageAssemblyError::WorkPathInsideSource {
+            source_root: source_root.to_path_buf(),
+            work_root: work_root.to_path_buf(),
+        });
+    }
     Ok(())
 }
 
@@ -928,12 +1200,13 @@ pub async fn publish_private_transfer_package(
     work_root: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> Result<VerifiedTransferPackage, TransferPackagePublishError> {
-    publish_private_transfer_package_internal(work_root, destination, None).await
+    publish_private_transfer_package_internal(work_root, destination, None, None).await
 }
 
 async fn publish_private_transfer_package_internal(
     work_root: impl AsRef<Path>,
     destination: impl AsRef<Path>,
+    expected_manifest: Option<&TransferManifest>,
     state_root: Option<&Path>,
 ) -> Result<VerifiedTransferPackage, TransferPackagePublishError> {
     let work_root = work_root.as_ref();
@@ -943,6 +1216,11 @@ async fn publish_private_transfer_package_internal(
     let manifest = load_and_verify_transfer_package(work_root)
         .await
         .map_err(|source| TransferPackagePublishError::PrivateVerification(Box::new(source)))?;
+    if expected_manifest.is_some_and(|expected| expected != &manifest) {
+        return Err(TransferPackagePublishError::PrivateManifestMismatch {
+            work_root: work_root.to_path_buf(),
+        });
+    }
     synchronize_private_package(work_root, &manifest)?;
     publish_private_directory_noreplace(work_root, destination)?;
     if let Some(state_root) = state_root {
@@ -982,7 +1260,11 @@ async fn publish_private_transfer_package_internal(
                 source: Box::new(source),
             },
         )?;
-    debug_assert_eq!(published_manifest, manifest);
+    if published_manifest != manifest {
+        return Err(TransferPackagePublishError::PublishedManifestMismatch {
+            destination: destination.to_path_buf(),
+        });
+    }
     if let Some(state_root) = state_root {
         let outcome = transition_transfer_work_state(
             state_root,
@@ -1220,7 +1502,7 @@ pub async fn load_and_verify_transfer_package(
 
     let manifest_path = root.join(TRANSFER_MANIFEST_FILE_NAME);
     require_regular_file(&manifest_path)?;
-    let manifest_bytes = std::fs::read(&manifest_path).map_err(|source| {
+    let manifest_bytes = read_stable_regular_file(&manifest_path).map_err(|source| {
         TransferPackageVerificationError::ReadManifest {
             path: manifest_path.clone(),
             source,
@@ -1230,7 +1512,80 @@ pub async fn load_and_verify_transfer_package(
 
     verify_package_layout(root, &manifest)?;
     verify_staged_transfer(root, &manifest).await?;
+    let final_manifest_bytes = read_stable_regular_file(&manifest_path).map_err(|source| {
+        TransferPackageVerificationError::ReadManifest {
+            path: manifest_path.clone(),
+            source,
+        }
+    })?;
+    if final_manifest_bytes != manifest_bytes {
+        return Err(TransferPackageVerificationError::ReadManifest {
+            path: manifest_path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transfer manifest changed while the package was being verified",
+            ),
+        });
+    }
     Ok(manifest)
+}
+
+fn read_stable_regular_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let before = std::fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transfer manifest must be a regular non-symlink file",
+        ));
+    }
+
+    let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    let after = std::fs::symlink_metadata(path)?;
+    if after.file_type().is_symlink() || !after.is_file() || !opened.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transfer manifest path changed while it was being opened",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transfer manifest path changed while it was being opened",
+            ));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let final_path = std::fs::symlink_metadata(path)?;
+    if final_path.file_type().is_symlink() || !final_path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transfer manifest path changed while it was being read",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if final_path.dev() != opened.dev() || final_path.ino() != opened.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transfer manifest path changed while it was being read",
+            ));
+        }
+    }
+    Ok(bytes)
 }
 
 fn verify_package_layout(
@@ -1396,24 +1751,68 @@ pub async fn verify_staged_transfer(
     }
 
     let database_path = root.join(STAGED_DATABASE_PATH);
-    verify_staged_object(&database_path, STAGED_DATABASE_PATH, manifest.database())?;
+    verify_staged_object(
+        root,
+        &database_path,
+        STAGED_DATABASE_PATH,
+        manifest.database(),
+    )?;
     verify_database_snapshot(&database_path)
         .await
         .map_err(TransferVerificationError::Database)?;
+    // SQLite verification opens the database independently and can yield while
+    // it runs. Recheck the exact bytes and every parent component before
+    // accepting the snapshot so an in-place change during that audit fails
+    // closed rather than being reported as the manifest-selected database.
+    verify_staged_object(
+        root,
+        &database_path,
+        STAGED_DATABASE_PATH,
+        manifest.database(),
+    )?;
 
     for attachment in manifest.attachments() {
         let path = root.join(attachment.relative_path());
-        verify_staged_object(&path, attachment.relative_path(), attachment.descriptor())?;
+        verify_staged_object(
+            root,
+            &path,
+            attachment.relative_path(),
+            attachment.descriptor(),
+        )?;
     }
 
     Ok(())
 }
 
 fn verify_staged_object(
+    root: &Path,
     path: &Path,
     logical_path: &str,
     descriptor: StoredObjectDescriptor,
 ) -> Result<(), TransferVerificationError> {
+    let relative_parent = Path::new(logical_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let mut current = root.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(TransferVerificationError::UnsafeObjectType { path: current });
+            }
+            Err(source) => {
+                return Err(TransferVerificationError::Object {
+                    logical_path: logical_path.to_owned(),
+                    source: StoredObjectVerificationError::Read {
+                        path: current,
+                        source,
+                    },
+                });
+            }
+        }
+    }
+
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -1436,4 +1835,73 @@ fn verify_staged_object(
         logical_path: logical_path.to_owned(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_database;
+    use crate::storage::ContentDigest;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn selected_manifest_mismatch_fails_before_publication() {
+        let root = unique_test_root("selected-manifest-mismatch");
+        std::fs::create_dir(&root).expect("isolated transfer test root should be created");
+        let database_path = root.join("source.sqlite3");
+        let pool = open_database(&database_path)
+            .await
+            .expect("isolated application database should open");
+        let staging_root = root.join("staging");
+        let prepared = prepare_transfer_staging(&pool, &staging_root, &[])
+            .await
+            .expect("isolated staging should prepare");
+        let work_root = root.join("private-package");
+        assemble_private_transfer_package(&staging_root, &work_root, prepared.manifest())
+            .await
+            .expect("private package should assemble");
+
+        let different_digest =
+            ContentDigest::from_str(&"00".repeat(32)).expect("fixed test digest should be valid");
+        let different_manifest =
+            TransferManifest::new(StoredObjectDescriptor::new(different_digest, 0), Vec::new())
+                .expect("different logical manifest should remain valid");
+        let destination = root.join("book.kagextra");
+
+        assert!(matches!(
+            publish_private_transfer_package_internal(
+                &work_root,
+                &destination,
+                Some(&different_manifest),
+                None,
+            )
+            .await,
+            Err(TransferPackagePublishError::PrivateManifestMismatch { work_root: path })
+                if path == work_root
+        ));
+        assert!(
+            work_root.exists(),
+            "rejected private work must remain available for inspection"
+        );
+        assert!(
+            !destination.exists(),
+            "manifest mismatch must be rejected before the atomic rename"
+        );
+
+        pool.close().await;
+        std::fs::remove_dir_all(root).expect("isolated transfer test root should be removable");
+    }
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        let parent = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temporary directory should resolve to a real path");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        parent.join(format!(
+            "kAccounting-Extra-01-transfer-unit-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 }

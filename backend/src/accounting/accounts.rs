@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use sqlx::SqlitePool;
 use thiserror::Error;
 
 const MAX_ACCOUNT_NAME_CHARS: usize = 120;
+const MAX_ACCOUNT_REVISION: i64 = i64::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Stable identifier for one account row.
@@ -136,7 +137,7 @@ pub struct AccountNode {
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
-/// Structural error found while reconstructing a defensive account tree.
+/// Structural error found while defensively validating an account hierarchy.
 pub enum AccountTreeError {
     #[error("account tree traversal could not find account {0}")]
     MissingNode(i64),
@@ -150,6 +151,8 @@ pub enum AccountTreeError {
     ElementMismatch { account_id: i64, parent_id: i64 },
     #[error("account tree contains a cycle at account {0}")]
     Cycle(i64),
+    #[error("active account {account_id} has inactive parent {parent_id}")]
+    InactiveParent { account_id: i64, parent_id: i64 },
 }
 
 /// Reconstructs roots and descendants in the order supplied by `accounts`.
@@ -182,6 +185,12 @@ pub fn build_account_tree(accounts: &[Account]) -> Result<Vec<AccountNode>, Acco
                     parent_id: parent_id.get(),
                 });
             }
+            if account.is_active && !parent.is_active {
+                return Err(AccountTreeError::InactiveParent {
+                    account_id: account.id.get(),
+                    parent_id: parent_id.get(),
+                });
+            }
 
             children_by_parent
                 .entry(parent_id)
@@ -192,33 +201,79 @@ pub fn build_account_tree(accounts: &[Account]) -> Result<Vec<AccountNode>, Acco
         }
     }
 
-    let mut visiting = HashSet::new();
-    let mut finished = HashSet::new();
-    let mut roots = Vec::with_capacity(root_ids.len());
-
-    for root_id in root_ids {
-        roots.push(build_account_node(
-            root_id,
-            &accounts_by_id,
-            &children_by_parent,
-            &mut visiting,
-            &mut finished,
-        )?);
-    }
-
-    for account in accounts {
-        if !finished.contains(&account.id) {
-            build_account_node(
+    // Resolve leaves before their parents. Besides providing a bottom-up build
+    // order, this detects cycles without recursive traversal or partially
+    // constructing a deeply nested value that would then need to be unwound.
+    let mut remaining_child_counts: HashMap<AccountId, usize> = accounts
+        .iter()
+        .map(|account| {
+            (
                 account.id,
-                &accounts_by_id,
-                &children_by_parent,
-                &mut visiting,
-                &mut finished,
-            )?;
+                children_by_parent.get(&account.id).map_or(0, Vec::len),
+            )
+        })
+        .collect();
+    let mut ready: VecDeque<AccountId> = accounts
+        .iter()
+        .filter(|account| remaining_child_counts[&account.id] == 0)
+        .map(|account| account.id)
+        .collect();
+    let mut build_order = Vec::with_capacity(accounts.len());
+
+    while let Some(id) = ready.pop_front() {
+        build_order.push(id);
+        remaining_child_counts.remove(&id);
+
+        if let Some(parent_id) = accounts_by_id[&id].parent_id {
+            let remaining = remaining_child_counts
+                .get_mut(&parent_id)
+                .ok_or(AccountTreeError::MissingNode(parent_id.get()))?;
+            *remaining -= 1;
+            if *remaining == 0 {
+                ready.push_back(parent_id);
+            }
         }
     }
 
-    Ok(roots)
+    if let Some(account) = accounts
+        .iter()
+        .find(|account| remaining_child_counts.contains_key(&account.id))
+    {
+        return Err(AccountTreeError::Cycle(account.id.get()));
+    }
+
+    let mut completed = HashMap::with_capacity(accounts.len());
+    for id in build_order {
+        let child_ids = children_by_parent
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut children = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids {
+            children.push(
+                completed
+                    .remove(child_id)
+                    .ok_or(AccountTreeError::MissingNode(child_id.get()))?,
+            );
+        }
+
+        completed.insert(
+            id,
+            AccountNode {
+                account: (*accounts_by_id[&id]).clone(),
+                children,
+            },
+        );
+    }
+
+    root_ids
+        .into_iter()
+        .map(|root_id| {
+            completed
+                .remove(&root_id)
+                .ok_or(AccountTreeError::MissingNode(root_id.get()))
+        })
+        .collect()
 }
 
 impl NewAccount {
@@ -243,6 +298,12 @@ impl NewAccount {
 pub enum AccountError {
     #[error("account name must contain 1 to {MAX_ACCOUNT_NAME_CHARS} non-control characters")]
     InvalidName,
+    #[error("an account with this name already exists among these siblings")]
+    DuplicateSiblingName,
+    #[error("a category with active descendants cannot be deactivated")]
+    ActiveDescendants,
+    #[error("activate the ancestor categories before activating or moving this account")]
+    InactiveAncestor,
     #[error("account {0} was not found")]
     NotFound(i64),
     #[error("parent account was not found")]
@@ -269,6 +330,8 @@ pub enum AccountError {
     Inactive,
     #[error("account revision conflict: expected {expected}, current revision is {actual}")]
     RevisionConflict { expected: i64, actual: i64 },
+    #[error("account {0} revision is exhausted and cannot be advanced")]
+    RevisionExhausted(i64),
     #[error("an account update must increase its revision by exactly one")]
     InvalidRevisionAdvance,
     #[error("invalid value in stored account field {field}: {value}")]
@@ -356,43 +419,13 @@ impl AccountRepository {
         build_account_tree(&accounts).map_err(AccountError::from)
     }
 
-    /// Returns the root-to-node lineage for one account.
+    /// Returns the root-to-node lineage after defensively validating every parent link.
+    ///
+    /// The iterative walk also bounds failure for a corrupted cycle instead of
+    /// relying on an unbounded recursive SQL query.
     pub async fn path_to(&self, id: AccountId) -> Result<Vec<Account>, AccountError> {
-        let rows = sqlx::query_as::<_, AccountRow>(
-            r#"
-            WITH RECURSIVE lineage(
-                id, parent_id, name, element, kind, is_active, revision,
-                created_at, updated_at, depth
-            ) AS (
-                SELECT id, parent_id, name, element, kind, is_active, revision,
-                       created_at, updated_at, 0
-                FROM accounts
-                WHERE id = ?
-
-                UNION ALL
-
-                SELECT parent.id, parent.parent_id, parent.name, parent.element,
-                       parent.kind, parent.is_active, parent.revision,
-                       parent.created_at, parent.updated_at, child.depth + 1
-                FROM accounts AS parent
-                JOIN lineage AS child ON parent.id = child.parent_id
-            )
-            SELECT id, parent_id, name, element, kind, is_active, revision,
-                   created_at, updated_at
-            FROM lineage
-            ORDER BY depth DESC
-            "#,
-        )
-        .bind(id.get())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(AccountError::Database)?;
-
-        if rows.is_empty() {
-            return Err(AccountError::NotFound(id.get()));
-        }
-
-        rows.into_iter().map(TryInto::try_into).collect()
+        let accounts = self.list_all().await?;
+        validated_account_path(&accounts, id)?.ok_or(AccountError::NotFound(id.get()))
     }
 
     /// Renames an account only if `expected_revision` is still current.
@@ -403,13 +436,15 @@ impl AccountRepository {
         requested_name: &str,
     ) -> Result<Account, AccountError> {
         let name = normalized_name(requested_name)?;
+        let mut transaction =
+            begin_validated_account_mutation(&self.pool, id, expected_revision, true).await?;
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
             UPDATE accounts
             SET name = ?,
                 revision = revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ? AND revision = ?
+            WHERE id = ? AND revision = ? AND revision < ?
             RETURNING id, parent_id, name, element, kind, is_active, revision,
                       created_at, updated_at
             "#,
@@ -417,11 +452,12 @@ impl AccountRepository {
         .bind(name)
         .bind(id.get())
         .bind(expected_revision)
-        .fetch_optional(&self.pool)
+        .bind(MAX_ACCOUNT_REVISION)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(map_database_error)?;
 
-        finish_account_mutation(&self.pool, row, id, expected_revision).await
+        finish_account_mutation(transaction, row, id, expected_revision).await
     }
 
     /// Moves an account or subtree only if the parent and revision remain valid.
@@ -431,13 +467,15 @@ impl AccountRepository {
         expected_revision: i64,
         parent_id: Option<AccountId>,
     ) -> Result<Account, AccountError> {
+        let mut transaction =
+            begin_validated_account_mutation(&self.pool, id, expected_revision, true).await?;
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
             UPDATE accounts
             SET parent_id = ?,
                 revision = revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ? AND revision = ?
+            WHERE id = ? AND revision = ? AND revision < ?
             RETURNING id, parent_id, name, element, kind, is_active, revision,
                       created_at, updated_at
             "#,
@@ -445,11 +483,12 @@ impl AccountRepository {
         .bind(parent_id.map(AccountId::get))
         .bind(id.get())
         .bind(expected_revision)
-        .fetch_optional(&self.pool)
+        .bind(MAX_ACCOUNT_REVISION)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(map_database_error)?;
 
-        finish_account_mutation(&self.pool, row, id, expected_revision).await
+        finish_account_mutation(transaction, row, id, expected_revision).await
     }
 
     /// Reclassifies an account only when its parent and children remain consistent.
@@ -459,13 +498,15 @@ impl AccountRepository {
         expected_revision: i64,
         element: AccountingElement,
     ) -> Result<Account, AccountError> {
+        let mut transaction =
+            begin_validated_account_mutation(&self.pool, id, expected_revision, true).await?;
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
             UPDATE accounts
             SET element = ?,
                 revision = revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ? AND revision = ?
+            WHERE id = ? AND revision = ? AND revision < ?
             RETURNING id, parent_id, name, element, kind, is_active, revision,
                       created_at, updated_at
             "#,
@@ -473,11 +514,12 @@ impl AccountRepository {
         .bind(element.as_str())
         .bind(id.get())
         .bind(expected_revision)
-        .fetch_optional(&self.pool)
+        .bind(MAX_ACCOUNT_REVISION)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(map_database_error)?;
 
-        finish_account_mutation(&self.pool, row, id, expected_revision).await
+        finish_account_mutation(transaction, row, id, expected_revision).await
     }
 
     /// Changes category/posting kind without allowing a posting parent.
@@ -487,13 +529,15 @@ impl AccountRepository {
         expected_revision: i64,
         kind: AccountKind,
     ) -> Result<Account, AccountError> {
+        let mut transaction =
+            begin_validated_account_mutation(&self.pool, id, expected_revision, true).await?;
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
             UPDATE accounts
             SET kind = ?,
                 revision = revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ? AND revision = ?
+            WHERE id = ? AND revision = ? AND revision < ?
             RETURNING id, parent_id, name, element, kind, is_active, revision,
                       created_at, updated_at
             "#,
@@ -501,11 +545,12 @@ impl AccountRepository {
         .bind(kind.as_str())
         .bind(id.get())
         .bind(expected_revision)
-        .fetch_optional(&self.pool)
+        .bind(MAX_ACCOUNT_REVISION)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(map_database_error)?;
 
-        finish_account_mutation(&self.pool, row, id, expected_revision).await
+        finish_account_mutation(transaction, row, id, expected_revision).await
     }
 
     /// Activates or deactivates an account at the expected revision.
@@ -515,13 +560,15 @@ impl AccountRepository {
         expected_revision: i64,
         is_active: bool,
     ) -> Result<Account, AccountError> {
+        let mut transaction =
+            begin_validated_account_mutation(&self.pool, id, expected_revision, true).await?;
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
             UPDATE accounts
             SET is_active = ?,
                 revision = revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ? AND revision = ?
+            WHERE id = ? AND revision = ? AND revision < ?
             RETURNING id, parent_id, name, element, kind, is_active, revision,
                       created_at, updated_at
             "#,
@@ -529,11 +576,12 @@ impl AccountRepository {
         .bind(is_active)
         .bind(id.get())
         .bind(expected_revision)
-        .fetch_optional(&self.pool)
+        .bind(MAX_ACCOUNT_REVISION)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(map_database_error)?;
 
-        finish_account_mutation(&self.pool, row, id, expected_revision).await
+        finish_account_mutation(transaction, row, id, expected_revision).await
     }
 
     /// Confirms that an account is currently an active posting leaf.
@@ -568,11 +616,8 @@ impl AccountRepository {
     ///
     /// Journal foreign keys also prevent deletion when any draft or posted line exists.
     pub async fn delete(&self, id: AccountId, expected_revision: i64) -> Result<(), AccountError> {
-        let mut transaction = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(AccountError::Database)?;
+        let mut transaction =
+            begin_validated_account_mutation(&self.pool, id, expected_revision, false).await?;
         let result = sqlx::query("DELETE FROM accounts WHERE id = ? AND revision = ?")
             .bind(id.get())
             .bind(expected_revision)
@@ -588,6 +633,13 @@ impl AccountRepository {
                         .fetch_one(&mut *transaction)
                         .await
                         .map_err(AccountError::Database)?;
+                if has_children {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(AccountError::Database)?;
+                    return Err(AccountError::HasChildren);
+                }
                 let (has_journal_history, has_draft_references): (bool, bool) = sqlx::query_as(
                     r#"
                         SELECT EXISTS(
@@ -611,9 +663,7 @@ impl AccountRepository {
                 .map_err(AccountError::Database)?;
                 // Report immutable posted history before a removable draft
                 // reference when both prevent deletion.
-                let domain_error = if has_children {
-                    AccountError::HasChildren
-                } else if has_journal_history {
+                let domain_error = if has_journal_history {
                     AccountError::HasJournalHistory
                 } else if has_draft_references {
                     AccountError::HasDraftReferences
@@ -662,6 +712,14 @@ impl AccountRepository {
     }
 }
 
+pub(crate) async fn list_accounts_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<Account>, AccountError> {
+    let rows: Vec<AccountRow> = sqlx::query_as("SELECT id, parent_id, name, element, kind, is_active, revision, created_at, updated_at FROM accounts ORDER BY id")
+        .fetch_all(&mut **transaction).await.map_err(AccountError::Database)?;
+    rows.into_iter().map(TryInto::try_into).collect()
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct AccountRow {
     id: i64,
@@ -669,7 +727,7 @@ struct AccountRow {
     name: String,
     element: String,
     kind: String,
-    is_active: bool,
+    is_active: i64,
     revision: i64,
     created_at: String,
     updated_at: String,
@@ -679,16 +737,60 @@ impl TryFrom<AccountRow> for Account {
     type Error = AccountError;
 
     fn try_from(row: AccountRow) -> Result<Self, Self::Error> {
+        let id = stored_account_id(row.id, "id")?;
+        let parent_id = row
+            .parent_id
+            .map(|value| stored_account_id(value, "parent_id"))
+            .transpose()?;
+        let normalized =
+            normalized_name(&row.name).map_err(|_| AccountError::InvalidStoredValue {
+                field: "name",
+                value: row.name.clone(),
+            })?;
+        if normalized != row.name {
+            return Err(AccountError::InvalidStoredValue {
+                field: "name",
+                value: row.name,
+            });
+        }
+        let is_active = match row.is_active {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(AccountError::InvalidStoredValue {
+                    field: "is_active",
+                    value: value.to_string(),
+                });
+            }
+        };
+        if row.revision < 1 {
+            return Err(AccountError::InvalidStoredValue {
+                field: "revision",
+                value: row.revision.to_string(),
+            });
+        }
+
         Ok(Self {
-            id: AccountId::new(row.id),
-            parent_id: row.parent_id.map(AccountId::new),
+            id,
+            parent_id,
             name: row.name,
             element: AccountingElement::try_from(row.element.as_str())?,
             kind: AccountKind::try_from(row.kind.as_str())?,
-            is_active: row.is_active,
+            is_active,
             revision: row.revision,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        })
+    }
+}
+
+fn stored_account_id(value: i64, field: &'static str) -> Result<AccountId, AccountError> {
+    if value > 0 {
+        Ok(AccountId::new(value))
+    } else {
+        Err(AccountError::InvalidStoredValue {
+            field,
+            value: value.to_string(),
         })
     }
 }
@@ -707,23 +809,107 @@ fn normalized_name(requested_name: &str) -> Result<&str, AccountError> {
     Ok(name)
 }
 
+async fn begin_validated_account_mutation<'a>(
+    pool: &'a SqlitePool,
+    id: AccountId,
+    expected_revision: i64,
+    advances_revision: bool,
+) -> Result<sqlx::Transaction<'a, sqlx::Sqlite>, AccountError> {
+    // Validate the stored snapshot before changing or deleting it. This keeps
+    // a field-specific mutation from silently repairing unrelated corruption.
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(AccountError::Database)?;
+    let row = sqlx::query_as::<_, AccountRow>(
+        r#"
+        SELECT id, parent_id, name, element, kind, is_active, revision,
+               created_at, updated_at
+        FROM accounts
+        WHERE id = ?
+        "#,
+    )
+    .bind(id.get())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(AccountError::Database)?;
+    let Some(row) = row else {
+        transaction
+            .rollback()
+            .await
+            .map_err(AccountError::Database)?;
+        return Err(AccountError::NotFound(id.get()));
+    };
+    let account = match Account::try_from(row) {
+        Ok(account) => account,
+        Err(error) => {
+            transaction
+                .rollback()
+                .await
+                .map_err(AccountError::Database)?;
+            return Err(error);
+        }
+    };
+
+    let error = if account.revision != expected_revision {
+        Some(AccountError::RevisionConflict {
+            expected: expected_revision,
+            actual: account.revision,
+        })
+    } else if advances_revision && account.revision == MAX_ACCOUNT_REVISION {
+        Some(AccountError::RevisionExhausted(id.get()))
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        transaction
+            .rollback()
+            .await
+            .map_err(AccountError::Database)?;
+        return Err(error);
+    }
+
+    Ok(transaction)
+}
+
 async fn finish_account_mutation(
-    pool: &SqlitePool,
+    mut transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
     row: Option<AccountRow>,
     id: AccountId,
     expected_revision: i64,
 ) -> Result<Account, AccountError> {
-    match row {
+    // Keep both returned-row decoding and a no-match diagnosis inside the
+    // writer transaction. A failed decode must not commit a partial mutation,
+    // and another writer must not change a conflict into a misleading result.
+    let result = match row {
         Some(row) => row.try_into(),
-        None => Err(mutation_error(pool, id, expected_revision).await),
+        None => Err(mutation_error(&mut transaction, id, expected_revision).await),
+    };
+
+    match result {
+        Ok(account) => {
+            transaction.commit().await.map_err(AccountError::Database)?;
+            Ok(account)
+        }
+        Err(error) => {
+            transaction
+                .rollback()
+                .await
+                .map_err(AccountError::Database)?;
+            Err(error)
+        }
     }
 }
 
-async fn mutation_error(pool: &SqlitePool, id: AccountId, expected_revision: i64) -> AccountError {
+async fn mutation_error(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: AccountId,
+    expected_revision: i64,
+) -> AccountError {
     let actual_revision: Option<i64> =
         match sqlx::query_scalar("SELECT revision FROM accounts WHERE id = ?")
             .bind(id.get())
-            .fetch_optional(pool)
+            .fetch_optional(&mut **transaction)
             .await
         {
             Ok(revision) => revision,
@@ -731,6 +917,9 @@ async fn mutation_error(pool: &SqlitePool, id: AccountId, expected_revision: i64
         };
 
     match actual_revision {
+        Some(actual) if actual == expected_revision && actual == MAX_ACCOUNT_REVISION => {
+            AccountError::RevisionExhausted(id.get())
+        }
         Some(actual) => AccountError::RevisionConflict {
             expected: expected_revision,
             actual,
@@ -742,7 +931,13 @@ async fn mutation_error(pool: &SqlitePool, id: AccountId, expected_revision: i64
 fn map_database_error(error: sqlx::Error) -> AccountError {
     let message = database_message(&error);
 
-    if message.contains("account parent not found") {
+    if message.contains("UNIQUE constraint failed: accounts.") {
+        AccountError::DuplicateSiblingName
+    } else if message.contains("category has active descendants") {
+        AccountError::ActiveDescendants
+    } else if message.contains("active account requires active ancestors") {
+        AccountError::InactiveAncestor
+    } else if message.contains("account parent not found") {
         AccountError::ParentNotFound
     } else if message.contains("account parent must be a category") {
         AccountError::ParentNotCategory
@@ -770,40 +965,59 @@ fn database_message(error: &sqlx::Error) -> &str {
     }
 }
 
-fn build_account_node(
+fn validated_account_path(
+    accounts: &[Account],
     id: AccountId,
-    accounts_by_id: &HashMap<AccountId, &Account>,
-    children_by_parent: &HashMap<AccountId, Vec<AccountId>>,
-    visiting: &mut HashSet<AccountId>,
-    finished: &mut HashSet<AccountId>,
-) -> Result<AccountNode, AccountTreeError> {
-    if !visiting.insert(id) {
-        return Err(AccountTreeError::Cycle(id.get()));
-    }
-
-    let mut children = Vec::new();
-    if let Some(child_ids) = children_by_parent.get(&id) {
-        children.reserve(child_ids.len());
-        for child_id in child_ids {
-            children.push(build_account_node(
-                *child_id,
-                accounts_by_id,
-                children_by_parent,
-                visiting,
-                finished,
-            )?);
+) -> Result<Option<Vec<Account>>, AccountTreeError> {
+    let mut accounts_by_id = HashMap::with_capacity(accounts.len());
+    for account in accounts {
+        if accounts_by_id.insert(account.id, account).is_some() {
+            return Err(AccountTreeError::DuplicateId(account.id.get()));
         }
     }
 
-    visiting.remove(&id);
-    finished.insert(id);
+    let Some(mut current) = accounts_by_id.get(&id).copied() else {
+        return Ok(None);
+    };
+    let mut visiting = HashSet::new();
+    let mut path = Vec::new();
 
-    let account = accounts_by_id
-        .get(&id)
-        .ok_or(AccountTreeError::MissingNode(id.get()))?;
+    loop {
+        if !visiting.insert(current.id) {
+            return Err(AccountTreeError::Cycle(current.id.get()));
+        }
+        path.push(current.clone());
 
-    Ok(AccountNode {
-        account: (**account).clone(),
-        children,
-    })
+        let Some(parent_id) = current.parent_id else {
+            break;
+        };
+        let parent =
+            accounts_by_id
+                .get(&parent_id)
+                .copied()
+                .ok_or(AccountTreeError::MissingParent {
+                    account_id: current.id.get(),
+                    parent_id: parent_id.get(),
+                })?;
+        if parent.kind != AccountKind::Category {
+            return Err(AccountTreeError::PostingParent(parent_id.get()));
+        }
+        if parent.element != current.element {
+            return Err(AccountTreeError::ElementMismatch {
+                account_id: current.id.get(),
+                parent_id: parent_id.get(),
+            });
+        }
+        if current.is_active && !parent.is_active {
+            return Err(AccountTreeError::InactiveParent {
+                account_id: current.id.get(),
+                parent_id: parent_id.get(),
+            });
+        }
+
+        current = parent;
+    }
+
+    path.reverse();
+    Ok(Some(path))
 }

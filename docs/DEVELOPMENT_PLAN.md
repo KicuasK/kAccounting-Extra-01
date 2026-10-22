@@ -1,155 +1,221 @@
 # Development Plan
 
-Status: draft; sequencing may change after the journal-entry interaction review.
+Status: active Version 01 completion plan, based on clean Git baseline
+`78d2924`.
 
-## Phase 1 — Foundation
+## Delivery constraints
 
-Status: complete. The verified initial source baseline is commit `067df40`.
+- The user delegated security and efficiency engineering decisions on
+  2026-10-22. Ask for a user decision only when a choice changes accounting
+  behavior, the supported workflow, or another user-visible product contract;
+  record security and performance choices in ADRs with tests and evidence.
+- Version 01 remaining work is time-boxed to at most 10 focused development
+  days from baseline `78d2924`, with a target of 8 days and days 9–10 reserved
+  for integration and acceptance fixes.
+- Waiting for required user decisions is calendar delay, not development time.
+  Any unresolved blocking decision moves the delivery date by the same amount.
+- Finish non-UI domain, storage, API, and runtime behavior before implementing
+  the remaining UI. UI implementation is the final product phase, not the
+  driver of accounting or storage policy.
+- High-volume attachments remain part of Version 01. They may not be deferred
+  merely to fit the time-box.
+- Version 01 targets Mac Safari. Touch-friendly iPad Safari is Version 02;
+  iPhone remains out of scope.
+- Multi-currency, CSV export, and TPASS are not part of Version 01.
+- A new feature or policy beyond the confirmed Version 01 scope requires an
+  explicit decision and a revised estimate; it must not silently consume the
+  10-day completion budget.
 
-- Verify the Mac development environment.
-- Initialize Git and the repository structure.
-- Record requirements, accounting invariants, UI direction, and open policy questions.
-- Create minimal Rust and TypeScript buildable projects.
+## Original implementation baseline (before the latest session)
 
-Exit gate: clean builds and tests run locally; no accounting behavior is implied by scaffolding.
+Implemented and verified:
 
-## Phase 2 — Accounts and database design
+- Exact integer money, balanced atomic posting, persistent versioned drafts,
+  posted-entry immutability, opening entries, and active posting-leaf checks.
+- Hierarchical account repository, cycle and cross-element protection,
+  optimistic concurrency, and fail-closed database integrity checks.
+- Posted-lines-only general journal, full and period ledger, trial balance,
+  five-element summary, and income/expense read models.
+- Read-only Axum routes with exact JSON integer strings and stable error
+  envelopes; no network listener or mutation routes are enabled.
+- Consistent SQLite snapshots, deterministic `.kagextra` manifests, strict
+  package verification, private assembly, no-replace publication, persistent
+  operation state, and conservative interrupted-export recovery.
+- Versioned bounded-memory encrypted-object streaming with purpose-separated
+  keys and rejection of wrong keys, tampering, reordering, duplication,
+  truncation, malformed framing, and trailing data.
+- Catalina-style read-only account-tree UI with frontend parsing, request
+  lifecycle, accessibility, and source-safety tests.
+- Full verification baseline: 364 Rust tests and 41 frontend tests, plus
+  formatting, Clippy, documentation, type checking, and production build.
 
-Status: in progress. The generic hierarchy, database constraints, Rust repository, startup integrity audit, and integration tests are implemented. The handwritten hierarchy and unresolved policies still require user decisions.
+Still required for Version 01:
 
-- Review the handwritten account hierarchy.
-- Define account node types, posting eligibility, parent rules, activation state, and deletion restrictions.
-- Design and review the SQLite schema and migrations.
-- Test cycle prevention and invalid moves.
+- Completed in this session: journal reference/explanation/line-memo metadata,
+  approved account-list rules, and the as-of balance sheet.
+- Attachment ownership, encrypted repository, lifecycle metadata, and database
+  integration are implemented; physical reclamation and runtime/UI integration remain.
+- Encrypted local database-plus-attachments backup and new-destination restore
+  primitives are implemented; application commands, retention, migration backup,
+  recipient-key export, and verified cross-Mac import remain.
+- Explicit localhost account/journal mutation APIs are implemented in-process;
+  listener, Tailscale origin/identity integration, and deployment remain.
+- Account management, journal, report, attachment, backup, and transfer UI.
+- Mac Safari end-to-end acceptance and operating documentation.
 
-Exit gate: schema review completed and account-domain tests pass.
+### Six-Codex integration session, 2026-10-22
 
-## Phase 3 — Accounting core
+The subsequent approximately 30-minute session added private runtime startup,
+explicit maintenance commands, authenticated managed-backup identity/retention,
+offline attachment reclamation with snapshot pins, attachment metadata/detach/
+verification and manual backup HTTP commands, recipient request/HPKE envelopes,
+and bounded-memory cross-device attachment re-encryption. These are integrated
+and verified without enabling real financial data or the user's Keychain.
 
-Status: in progress. Exact integer minor units, persistent editable/deletable
-drafts with optimistic concurrency, policy-neutral journal-line validation,
-SQLite persistence, atomic posting, and posted immutability are implemented.
-Reversal and explicit correction behavior remain to be designed and tested
-without depending on the editor.
+The remaining release gates are now complete encrypted package export/import,
+attachment upload/download, backup-before-legacy-migration orchestration,
+automatic active-book selection, private Tailscale identity/origin integration,
+installation/login acceptance, the full write/report/storage UI, and Mac Safari
+end-to-end acceptance. No remaining UI was implemented ahead of those non-UI
+gates. See `PARALLEL_BUILD_2026-10-22.md` for validation and limitations.
 
-- Implement exact money handling.
-- Implement draft persistence, validation, atomic posting, and immutability rules.
-- Add reversal and correction behavior.
-- Test balanced and unbalanced entries, invalid accounts, rollback, and concurrency-sensitive cases.
+## Approved Version 01 decisions
 
-Exit gate: accounting invariants are proven by automated tests.
+The user approved every recommendation in `VERSION01_DECISIONS.md` on
+2026-10-22 and separately confirmed that application-managed encryption at
+rest is required for live attachments, application-managed backups, and
+`.kagextra`. ADRs 0023–0024 define the encrypted-object and passwordless
+recipient-key designs; accounting and journal-domain work may proceed
+independently. No application password or passphrase is permitted; cross-Mac
+transfer uses a destination-generated public recipient request.
 
-## Phase 4 — API and account management UI
+- Exact stored and displayed TWD minor-unit scale.
+- General Journal header fields, reference numbering, explanation fields,
+  account search, debit/credit input, autosave, and crash-recovery behavior.
+- Reversal and correction rules, including inactive accounts and reversal
+  relationships.
+- Attachment ownership, allowed file types, size limits, retention,
+  deduplication, and encryption requirements.
+- Initial chart-of-accounts content and remaining account naming/order policy.
+- Balance-sheet classification and whether period closing/locking is included.
+- Backup frequency, retention, encryption, and restore-validation policy.
+- Final macOS Application Support path, Tailscale activation timing, and
+  whether application authentication is required in addition to Tailscale.
 
-Status: read-only backend route foundation complete. Health, account detail/tree,
-draft and posted-entry reads, general journal, trial balance, five-element
-summary, period ledger, and income/expense routes are tested in-process with no
-network listener. Mutation routes, authentication, serving, and all UI work
-remain pending.
+## Remaining execution order
 
-- Add backend endpoints with structured validation errors.
-- Build the Catalina-style application shell and account tree.
-- Verify keyboard, touch, Safari layout, and font behavior.
+### Step 1 — Close accounting and data contracts
 
-Exit gate: nested accounts can be safely maintained through the UI.
+Planned effort: days 1–2.
 
-## Phase 5 — Journal interaction
+- Record the required decisions above.
+- Completed: reversal and explicit correction domain behavior with invariant
+  tests (ADR 0025).
+- Finalize the Version 01 account, settings, attachment, and journal metadata
+  contracts without depending on UI behavior.
+- Add forward-only migrations and integrity checks for the accepted contracts.
 
-- Review and approve the General Journal editing workflow.
-- Implement only after the interaction specification is accepted.
+Exit gate: every Version 01 accounting and attachment write has an approved
+domain rule, schema, and automated invariant test.
 
-Exit gate: entry creation, balancing feedback, posting, and correction are usable on Mac and iPad.
+Progress: reversal and explicit correction domain behavior, forward migration,
+SQLite enforcement, integrity audit, and invariant tests are complete in ADR
+0025. Journal/account metadata, attachment metadata/repository, and statement
+contracts are now implemented in ADRs 0026–0029. Active-book settings and
+application integration remain. See `BUILD_SESSION_2026-10-22.md` for the
+current handoff.
 
-## Phase 6 — Ledgers and reports
+### Step 2 — Complete attachments, backup, import, and transfer
 
-Status: backend general-journal, full and period general-ledger, trial-balance,
-five-element summary, and period income/expense read models are implemented
-early because they are policy-neutral proofs that reports derive only from
-posted lines. General journal presentation and balance sheet remain pending; no
-closing or current/non-current policy has been assumed.
+Planned effort: days 3–5.
 
-- Journal and general ledger.
-- Trial balance.
-- Balance sheet.
-- Income/expense report.
-- Reconciliation tests across all reports.
+- Implement the local attachment repository and permanent database references.
+- Select every referenced attachment automatically for snapshots and exports.
+- Complete verified `.kagextra` import into new local storage without
+  overwriting the only valid book.
+- Complete consistent database-plus-attachments backup and restore.
+- Encrypt live attachment objects, application-managed backups, and
+  `.kagextra` payloads without publishing or retaining plaintext intermediate
+  artifacts.
+- Exercise capacity failure, interrupted removable-drive work, incompatible
+  versions, destination conflicts, and restart recovery.
 
-## Phase 7 — Operations
+Exit gate: export, import, backup, and restore leave either the previous
+complete state or a new verified complete state, with source data preserved.
 
-Status: the backend now provides a verified, owner-only, no-overwrite SQLite
-snapshot primitive. Scheduling, destination/retention/encryption policy,
-restore, service startup, and private network configuration remain
-pending.
+### Step 3 — Add write APIs and the private runtime
 
-- Consistent backup and restore.
-- User LaunchAgent.
-- Localhost binding and Tailscale Serve.
-- End-to-end verification and operating documentation.
+Planned effort: day 6.
 
-## Storage safety workstream — required before write API or UI
+- Add structured mutation routes for accounts, drafts, posting, correction,
+  attachments, backup, import, and export.
+- Serve only on the approved localhost boundary and keep Funnel prohibited.
+- Integrate the frontend bundle, final runtime data path, authentication
+  decision, LaunchAgent, and Tailscale Serve configuration.
+- Add API and runtime tests before exposing any mutation route.
 
-Status: in progress. Normal use is confirmed to keep the live book on local Mac
-storage. `.kagextra` is an application-managed transfer artifact used when
-moving to another computer; it is not the live-book location. Implemented
-foundations now include SHA-256 plus exact-length descriptors, a versioned
-logical manifest model, strict deterministic `manifest.json` encoding, bounded
-copy failure handling, read-only
-database-plus-attachment staging verification, strict physical package-layout
-verification, a monotonic transfer lifecycle, verified no-overwrite publication
-for local stored objects, and atomic no-replace publication of complete private
-directories. An already verified staging tree can now be copied into a new
-owner-only private package directory, given its deterministic manifest, and the
-assembled result is independently reverified. Conservative publication now
-synchronizes every declared file and every package directory, publishes with an
-atomic no-replace rename, synchronizes the destination parent, and reverifies
-the public package before reporting success. A single staged-export operation
-now allocates same-file-system private work, rejects known destination
-conflicts before copying, and runs assembly through verified publication while
-preserving the source and actionable failure state. The backend can also create
-verified owner-only staging from a SQLite point-in-time snapshot plus an
-explicit attachment set whose source bytes must match caller-supplied SHA-256
-and exact-length descriptors; unsafe paths and changed objects fail before any
-public package exists. An end-to-end backend operation now allocates that local
-staging, rejects known destination conflicts before snapshot work, runs the
-complete conservative package export, and cleans local staging only after the
-public package verifies; failed work is retained and post-success cleanup is a
-warning rather than an ambiguous failure. The physical
-`.kagextra` container is now confirmed as a macOS directory package.
-Strict private `operation-state.json` persistence now supports owner-only
-create-new records, bounded decoding, locked atomic updates, directory
-synchronization, and monotonic stale-safe transitions. Integration of those
-records at the live export publication boundaries, automatic
-database-referenced attachment selection, removable-drive compatibility
-validation, and restart recovery remain pending.
+Exit gate: every supported write is authorized by the domain layer, atomic
+where required, returns actionable errors, and is reachable only through the
+approved private boundary.
 
-1. Complete the live-book and attachment-store contract, directory-package
-   orchestration and persistent work-state
-   without treating the package as a true single file internally.
-2. Extend the implemented interrupted-read, capacity-style write, invalid
-   package, symlink, corruption, and post-publish cleanup failure coverage to
-   process termination and physical publication failures.
-3. Build a consistent database-plus-attachments export and verified import that
-   never overwrites the only valid book.
-4. Test interrupted removable-drive copies, incomplete packages, incompatible
-   versions, and destination conflicts.
+### Step 4 — Build the Version 01 UI last
 
-Exit gate: every operation leaves either the previous complete state or a new
-verified complete state; the source is never deleted automatically and no
-ambiguous failure can cause duplicate accounting writes.
+Planned effort: days 7–9.
+
+- Finish account creation, rename, move, activation, balance, and history UI.
+- Implement the separately approved General Journal editor, drafts, balancing
+  feedback, posting, reversal, and correction flows.
+- Add journal, ledger, trial-balance, balance-sheet, and income/expense views.
+- Add attachment, backup, export, import, and recovery status interfaces.
+- Preserve the Catalina light Aqua direction, Mac keyboard workflow, exact
+  amount display, and account-name mixed-script font rules.
+
+Exit gate: one user can complete the full Version 01 workflow in Mac Safari
+without database, terminal, or Finder intervention.
+
+### Step 5 — Acceptance and release baseline
+
+Planned effort: day 10, or days 9–10 when contingency is needed.
+
+- Run the complete automated verifier and Mac Safari end-to-end scenarios.
+- Test a large representative account tree and high-volume attachment set with
+  isolated data, never real financial data.
+- Verify create/open, account maintenance, draft, posting, correction, every
+  report, backup, export, import, restore, restart, and failure recovery.
+- Finish operating, backup, restore, update, and troubleshooting documentation.
+- Commit a clean Version 01 release candidate; do not push or deploy without
+  separate authorization.
+
+Exit gate: all Version 01 acceptance criteria pass from a clean checkout and
+the Git worktree is clean.
+
+## Forecast
+
+- Best case: 8 focused development days.
+- Planned case: 10 focused development days.
+- Calendar equivalent: about 1.5–2 working weeks if required decisions are
+  answered immediately and the confirmed scope does not change.
+- Main schedule risks: passwordless recipient-key and Keychain integration,
+  removable-drive behavior on the target file system,
+  authentication/Tailscale integration, and defects discovered during real
+  Mac Safari acceptance.
+
+This forecast is for the confirmed Version 01 scope only. It includes
+high-volume attachments and private Mac operation, but excludes Version 02 and
+later work below.
 
 ## Version 02
 
+- Touch-friendly iPad Safari interface and iPad-specific package workflow.
 - CSV export.
 
 ## Later phase — TPASS tracking
 
-Status: confirmed future feature; not yet scheduled for implementation.
+Status: confirmed future feature; not scheduled for Version 01.
 
-- Resolve the policy and interaction questions in `docs/TPASS_FUTURE_FEATURE.md`.
-- Design TPASS purchase, pass-period, ride-evidence, and amortization models for this project's Rust/SQLite architecture.
-- Add invariant tests before or with implementation, including atomic purchase posting, non-financial ride recording, exact amortization, idempotency, and protection of posted entries.
-- Build the TPASS and Journal integrations only after the general journal interaction design is approved.
-- Validate the complete flow with isolated test books; do not modify real financial data.
-
-Exit gate: TPASS purchases post exactly once, rides affect only evidence and statistics, amortization reconciles exactly to the pass cost, and all related accounting invariants pass automated tests.
-
+- Resolve the policy and interaction questions in `TPASS_FUTURE_FEATURE.md`.
+- Design TPASS purchase, pass-period, ride-evidence, and amortization models.
+- Add invariant tests before or with implementation.
+- Build TPASS and Journal integrations only after the General Journal
+  interaction design is approved and Version 01 is complete.
+- Validate with isolated test books; never modify real financial data.

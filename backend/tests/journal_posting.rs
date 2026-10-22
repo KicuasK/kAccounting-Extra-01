@@ -2,8 +2,8 @@ use kaccounting_backend::accounting::accounts::{
     Account, AccountError, AccountId, AccountKind, AccountRepository, AccountingElement, NewAccount,
 };
 use kaccounting_backend::accounting::journal::{
-    JournalDate, JournalError, JournalLineInput, JournalRepository, JournalSide, PostEntry,
-    SaveDraftEntry,
+    JournalDate, JournalError, JournalLineInput, JournalRepository, JournalSide,
+    JournalValidationError, PostEntry, SaveDraftEntry,
 };
 use kaccounting_backend::accounting::money::MinorUnits;
 use kaccounting_backend::db::{open_database, open_memory_database};
@@ -80,8 +80,8 @@ async fn balanced_entry_posts_atomically_with_exact_minor_units() {
         .post(PostEntry::new(
             JournalDate::parse("2026-10-22").unwrap(),
             vec![
-                line(cash.id, JournalSide::Debit, 9_007_199_254_740_993),
-                line(capital.id, JournalSide::Credit, 9_007_199_254_740_993),
+                line(cash.id, JournalSide::Debit, i64::MAX),
+                line(capital.id, JournalSide::Credit, i64::MAX),
             ],
         ))
         .await
@@ -115,15 +115,79 @@ async fn balanced_entry_posts_atomically_with_exact_minor_units() {
     assert_eq!(
         stored_lines,
         vec![
-            (1, cash.id.get(), "debit".to_owned(), 9_007_199_254_740_993,),
-            (
-                2,
-                capital.id.get(),
-                "credit".to_owned(),
-                9_007_199_254_740_993,
-            ),
+            (1, cash.id.get(), "debit".to_owned(), i64::MAX),
+            (2, capital.id.get(), "credit".to_owned(), i64::MAX),
         ]
     );
+}
+
+#[tokio::test]
+async fn large_compound_entry_preserves_exact_totals_and_line_order() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool);
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+    let mut lines = Vec::with_capacity(512);
+    lines.extend((0..256).map(|_| line(cash.id, JournalSide::Debit, 1)));
+    lines.extend((0..256).map(|_| line(revenue.id, JournalSide::Credit, 1)));
+
+    let posted = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-22").unwrap(),
+            lines,
+        ))
+        .await
+        .expect("a large exactly balanced compound entry should post atomically");
+
+    assert_eq!(posted.lines.len(), 512);
+    for (index, stored) in posted.lines.iter().enumerate() {
+        assert_eq!(stored.line_no, i64::try_from(index + 1).unwrap());
+        assert_eq!(stored.amount, MinorUnits::new(1));
+        let expected_side = if index < 256 {
+            JournalSide::Debit
+        } else {
+            JournalSide::Credit
+        };
+        assert_eq!(stored.side, expected_side);
+    }
+    assert_eq!(journal.get_posted(posted.id).await.unwrap(), posted);
+}
+
+#[tokio::test]
+async fn opening_balances_use_one_balanced_posted_entry() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "期初現金", AccountingElement::Asset).await;
+    let opening_equity = posting_account(&accounts, "期初權益", AccountingElement::Equity).await;
+
+    let rejected = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-01-01").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 50_000),
+                line(opening_equity.id, JournalSide::Credit, 49_999),
+            ],
+        ))
+        .await
+        .expect_err("an opening amount cannot bypass balanced-entry validation");
+    assert!(matches!(rejected, JournalError::Validation(_)));
+    assert_eq!(row_counts(&pool).await, (0, 0));
+
+    let opening = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-01-01").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 50_000),
+                line(opening_equity.id, JournalSide::Credit, 50_000),
+            ],
+        ))
+        .await
+        .expect("opening balances should post through the normal balanced journal boundary");
+
+    assert_eq!(opening.lines.len(), 2);
+    assert_eq!(row_counts(&pool).await, (1, 2));
 }
 
 #[tokio::test]
@@ -150,6 +214,57 @@ async fn posted_entry_round_trips_through_a_consistent_read_snapshot() {
         .expect("posted entry should reload");
 
     assert_eq!(reloaded, posted);
+}
+
+#[tokio::test]
+async fn posted_entry_read_rejects_non_contiguous_stored_line_numbers() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let capital = posting_account(&accounts, "投入資本", AccountingElement::Equity).await;
+    let entry_id: i64 = sqlx::query_scalar(
+        "INSERT INTO journal_entries (entry_date) VALUES ('2026-10-22') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for (line_no, account_id, side) in [(2_i64, cash.id, "debit"), (3_i64, capital.id, "credit")] {
+        sqlx::query(
+            r#"
+            INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
+            VALUES (?, ?, ?, ?, 100)
+            "#,
+        )
+        .bind(entry_id)
+        .bind(line_no)
+        .bind(account_id.get())
+        .bind(side)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        r#"
+        UPDATE journal_entries
+        SET status = 'posted',
+            posted_at = '2026-10-22T00:00:00.000Z',
+            revision = revision + 1
+        WHERE id = ?
+        "#,
+    )
+    .bind(entry_id)
+    .execute(&pool)
+    .await
+    .expect("test setup demonstrates the storage-level ordering gap");
+
+    let error = journal
+        .get_posted(kaccounting_backend::accounting::journal::JournalEntryId::new(entry_id))
+        .await
+        .expect_err("posted reads must fail closed on non-contiguous line numbers");
+    assert!(
+        matches!(error, JournalError::InvalidStoredValue(message) if message.contains("expected line number 1, found 2"))
+    );
 }
 
 #[tokio::test]
@@ -199,6 +314,121 @@ async fn arithmetic_validation_failure_writes_nothing() {
 }
 
 #[tokio::test]
+async fn every_pure_posting_guard_preserves_existing_database_state() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+    let existing = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-21").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 50),
+                line(revenue.id, JournalSide::Credit, 50),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let invalid_cases = [
+        ("empty", vec![]),
+        ("single", vec![line(cash.id, JournalSide::Debit, 100)]),
+        (
+            "zero",
+            vec![
+                line(cash.id, JournalSide::Debit, 0),
+                line(revenue.id, JournalSide::Credit, 1),
+            ],
+        ),
+        (
+            "negative",
+            vec![
+                line(cash.id, JournalSide::Debit, -1),
+                line(revenue.id, JournalSide::Credit, 1),
+            ],
+        ),
+        (
+            "unbalanced",
+            vec![
+                line(cash.id, JournalSide::Debit, 101),
+                line(revenue.id, JournalSide::Credit, 100),
+            ],
+        ),
+        (
+            "debit-overflow",
+            vec![
+                line(cash.id, JournalSide::Debit, i64::MAX),
+                line(cash.id, JournalSide::Debit, 1),
+                line(revenue.id, JournalSide::Credit, i64::MAX),
+            ],
+        ),
+        (
+            "credit-overflow",
+            vec![
+                line(cash.id, JournalSide::Debit, i64::MAX),
+                line(revenue.id, JournalSide::Credit, i64::MAX),
+                line(revenue.id, JournalSide::Credit, 1),
+            ],
+        ),
+    ];
+
+    for (case, lines) in invalid_cases {
+        let error = journal
+            .post(PostEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                lines,
+            ))
+            .await
+            .unwrap_err();
+        match case {
+            "empty" | "single" => {
+                assert!(matches!(
+                    error,
+                    JournalError::Validation(JournalValidationError::TooFewLines)
+                ));
+            }
+            "zero" | "negative" => {
+                assert!(matches!(
+                    error,
+                    JournalError::Validation(JournalValidationError::NonPositiveAmount {
+                        line_index: 0
+                    })
+                ));
+            }
+            "unbalanced" => {
+                assert!(matches!(
+                    error,
+                    JournalError::Validation(JournalValidationError::Unbalanced {
+                        debit: 101,
+                        credit: 100,
+                    })
+                ));
+            }
+            "debit-overflow" => {
+                assert!(matches!(
+                    error,
+                    JournalError::Validation(JournalValidationError::TotalOverflow {
+                        side: JournalSide::Debit,
+                    })
+                ));
+            }
+            "credit-overflow" => {
+                assert!(matches!(
+                    error,
+                    JournalError::Validation(JournalValidationError::TotalOverflow {
+                        side: JournalSide::Credit,
+                    })
+                ));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(row_counts(&pool).await, (1, 2), "case {case}");
+        assert_eq!(journal.get_posted(existing.id).await.unwrap(), existing);
+    }
+}
+
+#[tokio::test]
 async fn account_eligibility_failure_rolls_back_the_staged_draft() {
     let pool = open_memory_database().await.expect("database should open");
     let accounts = AccountRepository::new(pool.clone());
@@ -223,6 +453,66 @@ async fn account_eligibility_failure_rolls_back_the_staged_draft() {
 
     assert!(matches!(error, JournalError::AccountInactive(id) if id == inactive.id.get()));
     assert_eq!(row_counts(&pool).await, (0, 0));
+}
+
+#[tokio::test]
+async fn database_rejection_at_the_final_posting_transition_rolls_back_every_staged_row() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_reject_final_posting_transition
+        BEFORE UPDATE OF status ON journal_entries
+        WHEN OLD.status = 'draft' AND NEW.status = 'posted'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced final posting failure');
+        END
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("test trigger should install");
+
+    let error = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-22").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 100),
+                line(revenue.id, JournalSide::Credit, 100),
+            ],
+        ))
+        .await
+        .expect_err("a final transition failure must abort the whole posting transaction");
+
+    assert!(
+        matches!(error, JournalError::Database(ref source) if source.to_string().contains("forced final posting failure"))
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        (0, 0),
+        "neither the staged header nor any staged line may escape rollback"
+    );
+
+    sqlx::query("DROP TRIGGER test_reject_final_posting_transition")
+        .execute(&pool)
+        .await
+        .expect("test trigger should be removable after rollback");
+    let posted = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-22").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 100),
+                line(revenue.id, JournalSide::Credit, 100),
+            ],
+        ))
+        .await
+        .expect("the repository should remain usable after a rolled-back posting attempt");
+    assert_eq!(journal.get_posted(posted.id).await.unwrap(), posted);
+    assert_eq!(row_counts(&pool).await, (1, 2));
 }
 
 #[tokio::test]
@@ -275,6 +565,43 @@ async fn missing_and_category_accounts_are_rejected_without_partial_rows() {
 }
 
 #[tokio::test]
+async fn posting_leaf_guard_rejects_a_corrupted_posting_parent_without_writes() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+
+    sqlx::query("DROP TRIGGER accounts_validate_parent_insert")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass only the parent-kind insertion guard");
+    sqlx::query(
+        r#"
+        INSERT INTO accounts (parent_id, name, element, kind)
+        VALUES (?, '損壞子節點', 'asset', 'category')
+        "#,
+    )
+    .bind(cash.id.get())
+    .execute(&pool)
+    .await
+    .expect("test setup should simulate a posting account with a child");
+
+    let error = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-22").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 100),
+                line(revenue.id, JournalSide::Credit, 100),
+            ],
+        ))
+        .await
+        .expect_err("a posting parent must not receive a journal line");
+    assert!(matches!(error, JournalError::AccountHasChildren(id) if id == cash.id.get()));
+    assert_eq!(row_counts(&pool).await, (0, 0));
+}
+
+#[tokio::test]
 async fn sqlite_rejects_invalid_dates_and_direct_posted_inserts() {
     let pool = open_memory_database().await.expect("database should open");
 
@@ -319,6 +646,11 @@ async fn sqlite_constraints_independently_reject_ineligible_and_unbalanced_lines
         ))
         .await
         .expect("category should be created");
+    let inactive = posting_account(&accounts, "停用收入", AccountingElement::Income).await;
+    accounts
+        .set_active(inactive.id, inactive.revision, false)
+        .await
+        .expect("test account should be inactive");
     let entry_id: i64 = sqlx::query_scalar(
         "INSERT INTO journal_entries (entry_date) VALUES ('2026-10-22') RETURNING id",
     )
@@ -339,6 +671,23 @@ async fn sqlite_constraints_independently_reject_ineligible_and_unbalanced_lines
     .expect_err("category line should be blocked by SQLite");
     assert!(
         category_error
+            .to_string()
+            .contains("journal line account must be active and posting")
+    );
+
+    let inactive_error = sqlx::query(
+        r#"
+        INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
+        VALUES (?, 1, ?, 'credit', 100)
+        "#,
+    )
+    .bind(entry_id)
+    .bind(inactive.id.get())
+    .execute(&pool)
+    .await
+    .expect_err("inactive line account should be blocked by SQLite");
+    assert!(
+        inactive_error
             .to_string()
             .contains("journal line account must be active and posting")
     );
@@ -434,6 +783,191 @@ async fn sqlite_independently_requires_two_effective_lines() {
 }
 
 #[tokio::test]
+async fn sqlite_independently_rejects_a_corrupted_posting_account_with_children() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    sqlx::query("DROP TRIGGER accounts_validate_parent_insert")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass only the parent-kind insertion guard");
+    sqlx::query(
+        r#"
+        INSERT INTO accounts (parent_id, name, element, kind)
+        VALUES (?, '損壞子節點', 'asset', 'category')
+        "#,
+    )
+    .bind(cash.id.get())
+    .execute(&pool)
+    .await
+    .expect("test setup should simulate a posting account with a child");
+    let entry_id: i64 = sqlx::query_scalar(
+        "INSERT INTO journal_entries (entry_date) VALUES ('2026-10-22') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("draft should be inserted");
+
+    let error = sqlx::query(
+        r#"
+        INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
+        VALUES (?, 1, ?, 'debit', 100)
+        "#,
+    )
+    .bind(entry_id)
+    .bind(cash.id.get())
+    .execute(&pool)
+    .await
+    .expect_err("a posting account with children should be blocked by SQLite");
+
+    assert!(
+        error
+            .to_string()
+            .contains("journal line account must be active and posting")
+    );
+    assert_eq!(row_counts(&pool).await, (1, 0));
+}
+
+#[tokio::test]
+async fn sqlite_rechecks_active_leaf_eligibility_at_the_final_posting_transition() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+    let entry_id: i64 = sqlx::query_scalar(
+        "INSERT INTO journal_entries (entry_date) VALUES ('2026-10-22') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("draft should be inserted");
+    for (line_no, account_id, side) in [(1_i64, cash.id, "debit"), (2_i64, revenue.id, "credit")] {
+        sqlx::query(
+            r#"
+            INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
+            VALUES (?, ?, ?, ?, 100)
+            "#,
+        )
+        .bind(entry_id)
+        .bind(line_no)
+        .bind(account_id.get())
+        .bind(side)
+        .execute(&pool)
+        .await
+        .expect("eligible draft line should be inserted");
+    }
+
+    let inactive = accounts
+        .set_active(revenue.id, revenue.revision, false)
+        .await
+        .expect("line account should become inactive after the draft is saved");
+    let inactive_error = sqlx::query(
+        r#"
+        UPDATE journal_entries
+        SET status = 'posted',
+            posted_at = '2026-10-22T00:00:00.000Z',
+            revision = revision + 1
+        WHERE id = ?
+        "#,
+    )
+    .bind(entry_id)
+    .execute(&pool)
+    .await
+    .expect_err("SQLite must recheck active state at the posting boundary");
+    assert!(
+        inactive_error
+            .to_string()
+            .contains("journal line account must be active and posting")
+    );
+    let state_after_inactive: (String, Option<String>, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT entry.status, entry.posted_at, entry.revision, COUNT(line.id)
+        FROM journal_entries AS entry
+        LEFT JOIN journal_lines AS line ON line.entry_id = entry.id
+        WHERE entry.id = ?
+        GROUP BY entry.id
+        "#,
+    )
+    .bind(entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rejected draft should remain intact");
+    assert_eq!(state_after_inactive, ("draft".to_owned(), None, 1, 2));
+
+    accounts
+        .set_active(inactive.id, inactive.revision, true)
+        .await
+        .expect("line account should reactivate for the leaf-state check");
+    sqlx::query("DROP TRIGGER accounts_validate_parent_insert")
+        .execute(&pool)
+        .await
+        .expect("test setup should bypass only the parent-kind insertion guard");
+    let child_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO accounts (parent_id, name, element, kind)
+        VALUES (?, '損壞子節點', 'asset', 'category')
+        RETURNING id
+        "#,
+    )
+    .bind(cash.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("test setup should make a referenced posting account non-leaf");
+
+    let non_leaf_error = sqlx::query(
+        r#"
+        UPDATE journal_entries
+        SET status = 'posted',
+            posted_at = '2026-10-22T00:00:00.000Z',
+            revision = revision + 1
+        WHERE id = ?
+        "#,
+    )
+    .bind(entry_id)
+    .execute(&pool)
+    .await
+    .expect_err("SQLite must recheck leaf state at the posting boundary");
+    assert!(
+        non_leaf_error
+            .to_string()
+            .contains("journal line account must be active and posting")
+    );
+    assert_eq!(row_counts(&pool).await, (1, 2));
+
+    sqlx::query("DELETE FROM accounts WHERE id = ?")
+        .bind(child_id)
+        .execute(&pool)
+        .await
+        .expect("removing the corrupt child should restore leaf eligibility");
+    sqlx::query(
+        r#"
+        UPDATE journal_entries
+        SET status = 'posted',
+            posted_at = '2026-10-22T00:00:00.000Z',
+            revision = revision + 1
+        WHERE id = ?
+        "#,
+    )
+    .bind(entry_id)
+    .execute(&pool)
+    .await
+    .expect("the unchanged balanced draft should post after eligibility is restored");
+    let posted_state: (String, Option<String>, i64) =
+        sqlx::query_as("SELECT status, posted_at, revision FROM journal_entries WHERE id = ?")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("posted state should be readable");
+    assert_eq!(
+        posted_state,
+        (
+            "posted".to_owned(),
+            Some("2026-10-22T00:00:00.000Z".to_owned()),
+            2,
+        )
+    );
+}
+
+#[tokio::test]
 async fn sqlite_rejects_posting_when_a_side_total_overflows() {
     let pool = open_memory_database().await.expect("database should open");
     let accounts = AccountRepository::new(pool.clone());
@@ -520,7 +1054,28 @@ async fn posted_entries_and_lines_cannot_be_updated_or_deleted() {
             .bind(posted.id.get())
             .execute(&pool)
             .await,
+        sqlx::query("UPDATE journal_entries SET status = 'draft', posted_at = NULL WHERE id = ?")
+            .bind(posted.id.get())
+            .execute(&pool)
+            .await,
+        sqlx::query("UPDATE journal_entries SET revision = revision + 1 WHERE id = ?")
+            .bind(posted.id.get())
+            .execute(&pool)
+            .await,
         sqlx::query("UPDATE journal_lines SET amount_minor = 101 WHERE id = ?")
+            .bind(posted.lines[0].id.get())
+            .execute(&pool)
+            .await,
+        sqlx::query("UPDATE journal_lines SET side = 'credit' WHERE id = ?")
+            .bind(posted.lines[0].id.get())
+            .execute(&pool)
+            .await,
+        sqlx::query("UPDATE journal_lines SET line_no = 3 WHERE id = ?")
+            .bind(posted.lines[0].id.get())
+            .execute(&pool)
+            .await,
+        sqlx::query("UPDATE journal_lines SET account_id = ? WHERE id = ?")
+            .bind(revenue.id.get())
             .bind(posted.lines[0].id.get())
             .execute(&pool)
             .await,
@@ -528,12 +1083,64 @@ async fn posted_entries_and_lines_cannot_be_updated_or_deleted() {
             .bind(posted.lines[0].id.get())
             .execute(&pool)
             .await,
+        sqlx::query(
+            r#"
+            INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
+            VALUES (?, 3, ?, 'debit', 1)
+            "#,
+        )
+        .bind(posted.id.get())
+        .bind(cash.id.get())
+        .execute(&pool)
+        .await,
     ];
 
     for attempt in attempts {
         assert!(attempt.is_err(), "posted data mutation must be rejected");
     }
     assert_eq!(row_counts(&pool).await, (1, 2));
+    assert_eq!(journal.get_posted(posted.id).await.unwrap(), posted);
+}
+
+#[tokio::test]
+async fn a_later_opposite_entry_preserves_the_original_audit_record() {
+    let pool = open_memory_database().await.expect("database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+    let original = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-22").unwrap(),
+            vec![
+                line(cash.id, JournalSide::Debit, 100),
+                line(revenue.id, JournalSide::Credit, 100),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let opposite = journal
+        .post(PostEntry::new(
+            JournalDate::parse("2026-10-23").unwrap(),
+            vec![
+                line(revenue.id, JournalSide::Debit, 100),
+                line(cash.id, JournalSide::Credit, 100),
+            ],
+        ))
+        .await
+        .expect("a later ordinary balanced entry should create a separate audit record");
+
+    assert_ne!(opposite.id, original.id);
+    assert!(opposite.lines.iter().all(|line| {
+        original
+            .lines
+            .iter()
+            .all(|original_line| original_line.id != line.id)
+    }));
+    assert_eq!(journal.get_posted(original.id).await.unwrap(), original);
+    assert_eq!(journal.get_posted(opposite.id).await.unwrap(), opposite);
+    assert_eq!(row_counts(&pool).await, (2, 4));
 }
 
 #[tokio::test]
@@ -794,6 +1401,131 @@ async fn concurrent_deactivation_and_posting_serialize_without_partial_entries()
         }
         Err(error) => panic!("unexpected posting result: {error}"),
     }
+
+    pool.close().await;
+    remove_sqlite_files(&database_path);
+}
+
+#[tokio::test]
+async fn posting_waits_for_a_committing_deactivation_then_rolls_back_cleanly() {
+    let database_path = unique_database_path("post-waits-for-deactivation");
+    let pool = open_database(&database_path)
+        .await
+        .expect("temporary file database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+
+    let mut deactivation = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("deactivation should acquire SQLite's writer slot");
+    sqlx::query(
+        r#"
+        UPDATE accounts
+        SET is_active = 0,
+            revision = revision + 1
+        WHERE id = ? AND revision = ?
+        "#,
+    )
+    .bind(revenue.id.get())
+    .bind(revenue.revision)
+    .execute(&mut *deactivation)
+    .await
+    .expect("the uncommitted deactivation should be staged");
+
+    let posting_journal = journal.clone();
+    let posting = tokio::spawn(async move {
+        posting_journal
+            .post(PostEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                vec![
+                    line(cash.id, JournalSide::Debit, 100),
+                    line(revenue.id, JournalSide::Credit, 100),
+                ],
+            ))
+            .await
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !posting.is_finished(),
+        "posting must wait while the competing writer owns SQLite's writer slot"
+    );
+
+    deactivation
+        .commit()
+        .await
+        .expect("the competing deactivation should commit");
+    let error = posting
+        .await
+        .expect("posting task should not panic")
+        .expect_err("posting must observe the committed inactive account");
+
+    assert!(matches!(error, JournalError::AccountInactive(id) if id == revenue.id.get()));
+    assert_eq!(
+        row_counts(&pool).await,
+        (0, 0),
+        "the staged journal header must roll back with all of its lines"
+    );
+    let inactive: i64 = sqlx::query_scalar("SELECT is_active FROM accounts WHERE id = ?")
+        .bind(revenue.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("the committed account state should be readable");
+    assert_eq!(inactive, 0);
+
+    pool.close().await;
+    remove_sqlite_files(&database_path);
+}
+
+#[tokio::test]
+async fn concurrent_balanced_posts_create_two_complete_distinct_entries() {
+    let database_path = unique_database_path("two-concurrent-posts");
+    let pool = open_database(&database_path)
+        .await
+        .expect("temporary file database should open");
+    let accounts = AccountRepository::new(pool.clone());
+    let journal = JournalRepository::new(pool.clone());
+    let cash = posting_account(&accounts, "現金", AccountingElement::Asset).await;
+    let revenue = posting_account(&accounts, "收入", AccountingElement::Income).await;
+
+    let first = journal.post(PostEntry::new(
+        JournalDate::parse("2026-10-21").unwrap(),
+        vec![
+            line(cash.id, JournalSide::Debit, 100),
+            line(revenue.id, JournalSide::Credit, 100),
+        ],
+    ));
+    let second = journal.post(PostEntry::new(
+        JournalDate::parse("2026-10-22").unwrap(),
+        vec![
+            line(cash.id, JournalSide::Debit, 200),
+            line(revenue.id, JournalSide::Credit, 200),
+        ],
+    ));
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("the first balanced posting should serialize and succeed");
+    let second = second.expect("the second balanced posting should serialize and succeed");
+
+    assert_ne!(first.id, second.id);
+    assert!(first.lines.iter().all(|first_line| {
+        second
+            .lines
+            .iter()
+            .all(|second_line| first_line.id != second_line.id)
+    }));
+    assert_eq!(journal.get_posted(first.id).await.unwrap(), first);
+    assert_eq!(journal.get_posted(second.id).await.unwrap(), second);
+    assert_eq!(row_counts(&pool).await, (2, 4));
+    let drafts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM journal_entries WHERE status = 'draft'")
+            .fetch_one(&pool)
+            .await
+            .expect("no staged draft should remain after concurrent success");
+    assert_eq!(drafts, 0);
 
     pool.close().await;
     remove_sqlite_files(&database_path);

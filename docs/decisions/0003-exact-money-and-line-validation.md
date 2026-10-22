@@ -10,7 +10,10 @@ Status: accepted for the accounting-core foundation
 - Require at least two lines and exactly equal debit and credit totals before an entry can be posted.
 - Keep mutable account checks out of the pure validator. Account existence, active state, posting kind, and leaf status are checked again inside each SQLite posting transaction.
 
-For the current single-currency MVP, values are exact counts of the application's smallest configured TWD unit. This decision does not set that display/storage scale, add multi-currency support, or settle how a future currency table would define scale.
+For the current single-currency MVP, values are exact whole New Taiwan dollars:
+one stored unit displays as `NT$1`, with no fractional Version 01 amount. This
+scale was approved in `VERSION01_DECISIONS.md` on 2026-10-22. This decision does
+not add multi-currency support or settle a future currency-table design.
 
 ## Rationale
 
@@ -27,5 +30,5 @@ Keeping the line model independent from the eventual editor avoids deciding whet
 
 - All journal, ledger, and report calculations must use `MinorUnits` or another reviewed exact representation.
 - Zero and negative candidate line amounts are rejected. Reversals will swap debit and credit sides rather than storing negative lines.
-- Migration `0002` and `JournalRepository::post` now provide the transaction boundary, independent database constraints, immutability triggers, and posting/deactivation concurrency coverage. Reversal and correction behavior remain a later accounting-core decision.
+- Migration `0002` and `JournalRepository::post` provide the base transaction boundary, independent database constraints, immutability triggers, and posting/deactivation concurrency coverage. The subsequently approved Version 01 reversal and correction policy is implemented by migration `0004`, the atomic repository operations, and ADR 0025.
 - This ADR does not authorize implementation of the journal-entry editor.

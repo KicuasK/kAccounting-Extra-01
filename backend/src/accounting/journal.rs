@@ -97,20 +97,27 @@ impl JournalSide {
 /// This type intentionally says nothing about the eventual editor layout. It
 /// models the accounting fact that one positive amount belongs to exactly one
 /// side and one account.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalLineInput {
     pub account_id: AccountId,
     pub side: JournalSide,
     pub amount: MinorUnits,
+    pub memo: Option<String>,
 }
 
 impl JournalLineInput {
-    pub const fn new(account_id: AccountId, side: JournalSide, amount: MinorUnits) -> Self {
+    pub fn new(account_id: AccountId, side: JournalSide, amount: MinorUnits) -> Self {
         Self {
             account_id,
             side,
             amount,
+            memo: None,
         }
+    }
+
+    pub fn with_memo(mut self, memo: impl Into<String>) -> Self {
+        self.memo = Some(memo.into());
+        self
     }
 }
 
@@ -135,10 +142,42 @@ pub enum JournalValidationError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Minimal posting request; presentation-specific header fields are deferred.
+/// Posting request with the approved optional journal header fields.
 pub struct PostEntry {
     pub entry_date: JournalDate,
     pub lines: Vec<JournalLineInput>,
+    pub reference: Option<String>,
+    pub explanation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Permanent relationship carried by an immutable posted entry.
+pub enum PostedEntryRelationship {
+    Ordinary,
+    Reversal { original_entry_id: JournalEntryId },
+    Correction { original_entry_id: JournalEntryId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Request to post an explicit correcting entry linked to existing history.
+pub struct PostCorrection {
+    pub original_entry_id: JournalEntryId,
+    pub entry: PostEntry,
+    pub explanation: String,
+}
+
+impl PostCorrection {
+    pub fn new(
+        original_entry_id: JournalEntryId,
+        entry: PostEntry,
+        explanation: impl Into<String>,
+    ) -> Self {
+        Self {
+            original_entry_id,
+            entry,
+            explanation: explanation.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,11 +185,24 @@ pub struct PostEntry {
 pub struct SaveDraftEntry {
     pub entry_date: JournalDate,
     pub lines: Vec<JournalLineInput>,
+    pub reference: Option<String>,
+    pub explanation: Option<String>,
 }
 
 impl SaveDraftEntry {
     pub fn new(entry_date: JournalDate, lines: Vec<JournalLineInput>) -> Self {
-        Self { entry_date, lines }
+        Self {
+            entry_date,
+            lines,
+            reference: None,
+            explanation: None,
+        }
+    }
+
+    pub fn with_header(mut self, reference: Option<String>, explanation: Option<String>) -> Self {
+        self.reference = reference;
+        self.explanation = explanation;
+        self
     }
 }
 
@@ -162,6 +214,7 @@ pub struct DraftJournalLine {
     pub account_id: AccountId,
     pub side: JournalSide,
     pub amount: MinorUnits,
+    pub memo: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,12 +224,25 @@ pub struct DraftJournalEntry {
     pub entry_date: JournalDate,
     pub revision: i64,
     pub created_at: String,
+    pub reference: Option<String>,
+    pub explanation: Option<String>,
     pub lines: Vec<DraftJournalLine>,
 }
 
 impl PostEntry {
     pub fn new(entry_date: JournalDate, lines: Vec<JournalLineInput>) -> Self {
-        Self { entry_date, lines }
+        Self {
+            entry_date,
+            lines,
+            reference: None,
+            explanation: None,
+        }
+    }
+
+    pub fn with_header(mut self, reference: Option<String>, explanation: Option<String>) -> Self {
+        self.reference = reference;
+        self.explanation = explanation;
+        self
     }
 }
 
@@ -188,6 +254,7 @@ pub struct PostedJournalLine {
     pub account_id: AccountId,
     pub side: JournalSide,
     pub amount: MinorUnits,
+    pub memo: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +264,9 @@ pub struct PostedJournalEntry {
     pub entry_date: JournalDate,
     pub created_at: String,
     pub posted_at: String,
+    pub relationship: PostedEntryRelationship,
+    pub reference: Option<String>,
+    pub explanation: Option<String>,
     pub lines: Vec<PostedJournalLine>,
 }
 
@@ -221,6 +291,23 @@ pub enum JournalError {
     EntryNotFound(i64),
     #[error("journal entry {0} is not posted")]
     EntryNotPosted(i64),
+    #[error("journal entry {0} is already directly reversed")]
+    EntryAlreadyReversed(i64),
+    #[error("journal entry {0} is itself a reversal and cannot be directly reversed")]
+    CannotReverseReversal(i64),
+    #[error("reversal date {reversal_date} cannot precede original date {original_date}")]
+    ReversalDateBeforeOriginal {
+        reversal_date: String,
+        original_date: String,
+    },
+    #[error("a correcting journal entry requires a non-blank explanation")]
+    CorrectionExplanationRequired,
+    #[error("journal entry explanation contains a null character")]
+    InvalidExplanation,
+    #[error("journal reference or line memo contains a null character")]
+    InvalidMetadata,
+    #[error("correction header and request contain different explanations")]
+    ConflictingExplanation,
     #[error("journal entry {0} is not an editable draft")]
     EntryNotDraft(i64),
     #[error(
@@ -231,6 +318,8 @@ pub enum JournalError {
         expected_revision: i64,
         actual_revision: i64,
     },
+    #[error("journal draft {0} revision is exhausted and cannot be advanced")]
+    DraftRevisionExhausted(i64),
     #[error("stored journal entry is invalid: {0}")]
     InvalidStoredValue(String),
     #[error("journal database operation failed: {0}")]
@@ -253,17 +342,20 @@ impl JournalRepository {
         &self,
         input: SaveDraftEntry,
     ) -> Result<DraftJournalEntry, JournalError> {
+        validate_metadata(input.reference.as_deref(), input.explanation.as_deref())?;
         validate_draft_lines(&input.lines)?;
 
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
         let (entry_id, revision, created_at): (i64, i64, String) = sqlx::query_as(
             r#"
-            INSERT INTO journal_entries (entry_date)
-            VALUES (?)
+            INSERT INTO journal_entries (entry_date, reference, explanation)
+            VALUES (?, ?, ?)
             RETURNING id, revision, created_at
             "#,
         )
         .bind(input.entry_date.as_str())
+        .bind(input.reference.as_deref())
+        .bind(input.explanation.as_deref())
         .fetch_one(&mut *transaction)
         .await
         .map_err(JournalError::Database)?;
@@ -273,6 +365,8 @@ impl JournalRepository {
         Ok(DraftJournalEntry {
             id: JournalEntryId::new(entry_id),
             entry_date: input.entry_date,
+            reference: input.reference,
+            explanation: input.explanation,
             revision,
             created_at,
             lines,
@@ -288,21 +382,39 @@ impl JournalRepository {
         expected_revision: i64,
         input: SaveDraftEntry,
     ) -> Result<DraftJournalEntry, JournalError> {
+        // Lock the writer before inspecting the existing document. Besides
+        // preserving optimistic-concurrency semantics, this lets us reject a
+        // malformed stored draft without another writer changing it between
+        // validation and replacement.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(JournalError::Database)?;
+        validate_stored_draft_for_mutation(&mut transaction, id, expected_revision, true).await?;
+        validate_metadata(input.reference.as_deref(), input.explanation.as_deref())?;
         validate_draft_lines(&input.lines)?;
-
-        let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
         let updated: Option<(i64, String)> = sqlx::query_as(
             r#"
             UPDATE journal_entries
             SET entry_date = ?,
+                reference = ?,
+                explanation = ?,
                 revision = revision + 1
-            WHERE id = ? AND status = 'draft' AND revision = ?
+            WHERE id = ?
+              AND status = 'draft'
+              AND posted_at IS NULL
+              AND revision = ?
+              AND revision BETWEEN 1 AND ?
             RETURNING revision, created_at
             "#,
         )
         .bind(input.entry_date.as_str())
+        .bind(input.reference.as_deref())
+        .bind(input.explanation.as_deref())
         .bind(id.get())
         .bind(expected_revision)
+        .bind(i64::MAX - 1)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(JournalError::Database)?;
@@ -323,6 +435,8 @@ impl JournalRepository {
         Ok(DraftJournalEntry {
             id,
             entry_date: input.entry_date,
+            reference: input.reference,
+            explanation: input.explanation,
             revision,
             created_at,
             lines,
@@ -334,7 +448,7 @@ impl JournalRepository {
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
         let header: Option<StoredJournalHeader> = sqlx::query_as(
             r#"
-            SELECT entry_date, status, created_at, posted_at, revision
+            SELECT entry_date, status, created_at, posted_at, revision, reference, explanation
             FROM journal_entries
             WHERE id = ?
             "#,
@@ -346,9 +460,16 @@ impl JournalRepository {
         let Some(header) = header else {
             return Err(JournalError::EntryNotFound(id.get()));
         };
+        validate_stored_header_state(
+            id,
+            &header.status,
+            header.revision,
+            header.posted_at.as_deref(),
+        )?;
         if header.status != "draft" {
             return Err(JournalError::EntryNotDraft(id.get()));
         }
+        validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
         let entry_date = parse_stored_date(id, &header.entry_date)?;
         let lines = load_draft_lines(&mut transaction, id).await?;
         transaction.commit().await.map_err(JournalError::Database)?;
@@ -358,6 +479,8 @@ impl JournalRepository {
             entry_date,
             revision: header.revision,
             created_at: header.created_at,
+            reference: header.reference,
+            explanation: header.explanation,
             lines,
         })
     }
@@ -368,9 +491,29 @@ impl JournalRepository {
     /// receive a header from one revision paired with lines from another.
     pub async fn list_drafts(&self) -> Result<Vec<DraftJournalEntry>, JournalError> {
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
-        let headers: Vec<(i64, String, i64, String)> = sqlx::query_as(
+        let invalid_header: Option<(i64, String, i64, Option<String>)> = sqlx::query_as(
             r#"
-            SELECT id, entry_date, revision, created_at
+            SELECT id, status, revision, posted_at
+            FROM journal_entries
+            WHERE status NOT IN ('draft', 'posted')
+               OR revision < 1
+               OR (status = 'posted' AND revision < 2)
+               OR (status = 'draft' AND posted_at IS NOT NULL)
+               OR (status = 'posted' AND posted_at IS NULL)
+            ORDER BY id
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(JournalError::Database)?;
+        if let Some((stored_id, status, revision, posted_at)) = invalid_header {
+            let id = JournalEntryId::new(stored_id);
+            validate_stored_header_state(id, &status, revision, posted_at.as_deref())?;
+        }
+        let headers: Vec<StoredDraftListHeader> = sqlx::query_as(
+            r#"
+            SELECT id, entry_date, revision, created_at, reference, explanation
             FROM journal_entries
             WHERE status = 'draft'
             ORDER BY entry_date, id
@@ -387,7 +530,22 @@ impl JournalRepository {
                    line.line_no,
                    line.account_id,
                    line.side,
-                   line.amount_minor
+                   line.amount_minor,
+                   line.memo,
+                   EXISTS(
+                       SELECT 1 FROM accounts AS account
+                       WHERE account.id = line.account_id
+                   ) AS account_exists,
+                   EXISTS(
+                       SELECT 1
+                       FROM accounts AS account
+                       WHERE account.id = line.account_id
+                         AND account.kind = 'posting'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM accounts AS child
+                             WHERE child.parent_id = account.id
+                         )
+                   ) AS account_is_posting_leaf
             FROM journal_lines AS line
             JOIN journal_entries AS entry ON entry.id = line.entry_id
             WHERE entry.status = 'draft'
@@ -408,13 +566,26 @@ impl JournalRepository {
                     account_id: stored.account_id,
                     side: stored.side,
                     amount_minor: stored.amount_minor,
+                    memo: stored.memo,
+                    account_exists: stored.account_exists,
+                    account_is_posting_leaf: stored.account_is_posting_leaf,
                 });
         }
 
         let mut drafts = Vec::with_capacity(headers.len());
-        for (stored_id, stored_date, revision, created_at) in headers {
+        for header in headers {
+            let StoredDraftListHeader {
+                id: stored_id,
+                entry_date: stored_date,
+                revision,
+                created_at,
+                reference,
+                explanation,
+            } = header;
             let id = JournalEntryId::new(stored_id);
+            validate_metadata(reference.as_deref(), explanation.as_deref())?;
             let stored_lines = lines_by_entry.remove(&stored_id).unwrap_or_default();
+            validate_stored_line_order(id, &stored_lines)?;
             let lines = stored_lines
                 .into_iter()
                 .map(|stored| {
@@ -425,6 +596,7 @@ impl JournalRepository {
                         account_id,
                         side,
                         amount,
+                        memo: stored.memo,
                     })
                 })
                 .collect::<Result<Vec<_>, JournalError>>()?;
@@ -433,6 +605,8 @@ impl JournalRepository {
                 entry_date: parse_stored_date(id, &stored_date)?,
                 revision,
                 created_at,
+                reference,
+                explanation,
                 lines,
             });
         }
@@ -451,9 +625,25 @@ impl JournalRepository {
         id: JournalEntryId,
         expected_revision: i64,
     ) -> Result<(), JournalError> {
-        let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
+        // Deleting a damaged draft would hide corruption. Inspect it while
+        // holding SQLite's writer slot, then delete only the exact revision
+        // that was validated.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(JournalError::Database)?;
+        validate_stored_draft_for_mutation(&mut transaction, id, expected_revision, false).await?;
         let deleted: Option<i64> = sqlx::query_scalar(
-            "DELETE FROM journal_entries WHERE id = ? AND status = 'draft' AND revision = ? RETURNING id",
+            r#"
+            DELETE FROM journal_entries
+            WHERE id = ?
+              AND status = 'draft'
+              AND posted_at IS NULL
+              AND revision = ?
+              AND revision >= 1
+            RETURNING id
+            "#,
         )
         .bind(id.get())
         .bind(expected_revision)
@@ -482,9 +672,10 @@ impl JournalRepository {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(JournalError::Database)?;
-        let header: Option<(String, String)> = sqlx::query_as(
+        let header: Option<StoredPostedHeader> = sqlx::query_as(
             r#"
-            SELECT entry_date, created_at
+            SELECT entry_date, created_at, status, revision, posted_at,
+                   reverses_entry_id, corrects_entry_id, explanation, reference
             FROM journal_entries
             WHERE id = ? AND status = 'draft' AND revision = ?
             "#,
@@ -494,12 +685,28 @@ impl JournalRepository {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(JournalError::Database)?;
-        let Some((stored_date, created_at)) = header else {
+        let Some(header) = header else {
             return Err(
                 entry_not_draft_error(&mut transaction, id, Some(expected_revision)).await?,
             );
         };
-        let entry_date = parse_stored_date(id, &stored_date)?;
+        validate_stored_header_state(
+            id,
+            &header.status,
+            header.revision,
+            header.posted_at.as_deref(),
+        )?;
+        validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
+        let relationship = decode_stored_relationship(
+            id,
+            header.reverses_entry_id,
+            header.corrects_entry_id,
+            header.explanation.as_deref(),
+        )?;
+        if expected_revision == i64::MAX {
+            return Err(JournalError::DraftRevisionExhausted(id.get()));
+        }
+        let entry_date = parse_stored_date(id, &header.entry_date)?;
         let stored_lines = load_stored_lines(&mut transaction, id).await?;
         let line_inputs = stored_lines_to_inputs(id, &stored_lines)?;
         validate_journal_lines(&line_inputs)?;
@@ -513,11 +720,15 @@ impl JournalRepository {
             SET status = 'posted',
                 posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 revision = revision + 1
-            WHERE id = ? AND status = 'draft'
+            WHERE id = ?
+              AND status = 'draft'
+              AND posted_at IS NULL
+              AND revision = ?
             RETURNING posted_at
             "#,
         )
         .bind(id.get())
+        .bind(expected_revision)
         .fetch_one(&mut *transaction)
         .await
         .map_err(JournalError::Database)?;
@@ -527,8 +738,11 @@ impl JournalRepository {
         Ok(PostedJournalEntry {
             id,
             entry_date,
-            created_at,
+            created_at: header.created_at,
             posted_at,
+            relationship,
+            reference: header.reference,
+            explanation: header.explanation,
             lines,
         })
     }
@@ -540,81 +754,121 @@ impl JournalRepository {
         validate_journal_lines(&input.lines)?;
 
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
-        let (entry_id, created_at): (i64, String) = sqlx::query_as(
-            r#"
-            INSERT INTO journal_entries (entry_date)
-            VALUES (?)
-            RETURNING id, created_at
-            "#,
+        let posted = insert_and_post(
+            &mut transaction,
+            input,
+            PostedEntryRelationship::Ordinary,
+            None,
         )
-        .bind(input.entry_date.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(JournalError::Database)?;
+        .await?;
+        transaction.commit().await.map_err(JournalError::Database)?;
+        Ok(posted)
+    }
 
-        let mut posted_lines = Vec::with_capacity(input.lines.len());
-        for (line_index, line) in input.lines.iter().enumerate() {
-            require_postable_account(&mut transaction, line.account_id).await?;
-            let line_no = i64::try_from(line_index + 1).map_err(|_| JournalError::TooManyLines)?;
-            let line_id: i64 = sqlx::query_scalar(
-                r#"
-                INSERT INTO journal_lines (
-                    entry_id, line_no, account_id, side, amount_minor
-                )
-                VALUES (?, ?, ?, ?, ?)
-                RETURNING id
-                "#,
-            )
-            .bind(entry_id)
-            .bind(line_no)
-            .bind(line.account_id.get())
-            .bind(line.side.as_str())
-            .bind(line.amount.get())
-            .fetch_one(&mut *transaction)
+    /// Atomically posts an exact debit/credit-side reversal of one posted entry.
+    pub async fn reverse_posted(
+        &self,
+        original_id: JournalEntryId,
+        reversal_date: JournalDate,
+    ) -> Result<PostedJournalEntry, JournalError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(JournalError::Database)?;
-
-            posted_lines.push(PostedJournalLine {
-                id: JournalLineId::new(line_id),
-                line_no,
-                account_id: line.account_id,
-                side: line.side,
-                amount: line.amount,
+        let original = load_posted_for_relationship(&mut transaction, original_id).await?;
+        if matches!(
+            original.relationship,
+            PostedEntryRelationship::Reversal { .. }
+        ) {
+            return Err(JournalError::CannotReverseReversal(original_id.get()));
+        }
+        if reversal_date < original.entry_date {
+            return Err(JournalError::ReversalDateBeforeOriginal {
+                reversal_date: reversal_date.as_str().to_owned(),
+                original_date: original.entry_date.as_str().to_owned(),
             });
         }
-
-        let posted_at: String = sqlx::query_scalar(
-            r#"
-            UPDATE journal_entries
-            SET status = 'posted',
-                posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                revision = revision + 1
-            WHERE id = ? AND status = 'draft'
-            RETURNING posted_at
-            "#,
+        let existing_reversal: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM journal_entries WHERE reverses_entry_id = ? LIMIT 1",
         )
-        .bind(entry_id)
-        .fetch_one(&mut *transaction)
+        .bind(original_id.get())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(JournalError::Database)?;
+        if existing_reversal.is_some() {
+            return Err(JournalError::EntryAlreadyReversed(original_id.get()));
+        }
 
+        let lines = original
+            .lines
+            .iter()
+            .map(|line| {
+                JournalLineInput::new(
+                    line.account_id,
+                    match line.side {
+                        JournalSide::Debit => JournalSide::Credit,
+                        JournalSide::Credit => JournalSide::Debit,
+                    },
+                    line.amount,
+                )
+            })
+            .collect();
+        let posted = insert_and_post(
+            &mut transaction,
+            PostEntry::new(reversal_date, lines),
+            PostedEntryRelationship::Reversal {
+                original_entry_id: original_id,
+            },
+            None,
+        )
+        .await?;
         transaction.commit().await.map_err(JournalError::Database)?;
+        Ok(posted)
+    }
 
-        Ok(PostedJournalEntry {
-            id: JournalEntryId::new(entry_id),
-            entry_date: input.entry_date,
-            created_at,
-            posted_at,
-            lines: posted_lines,
-        })
+    /// Atomically posts a balanced correcting entry linked to existing history.
+    pub async fn post_correction(
+        &self,
+        request: PostCorrection,
+    ) -> Result<PostedJournalEntry, JournalError> {
+        if request
+            .entry
+            .explanation
+            .as_ref()
+            .is_some_and(|text| text != &request.explanation)
+        {
+            return Err(JournalError::ConflictingExplanation);
+        }
+        validate_explanation(&request.explanation)?;
+        validate_journal_lines(&request.entry.lines)?;
+
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(JournalError::Database)?;
+        load_posted_for_relationship(&mut transaction, request.original_entry_id).await?;
+        let posted = insert_and_post(
+            &mut transaction,
+            request.entry,
+            PostedEntryRelationship::Correction {
+                original_entry_id: request.original_entry_id,
+            },
+            Some(request.explanation),
+        )
+        .await?;
+        transaction.commit().await.map_err(JournalError::Database)?;
+        Ok(posted)
     }
 
     /// Loads one immutable posted entry and all of its lines in one read snapshot.
     pub async fn get_posted(&self, id: JournalEntryId) -> Result<PostedJournalEntry, JournalError> {
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
-        let header: Option<StoredJournalHeader> = sqlx::query_as(
+        let header: Option<StoredPostedHeader> = sqlx::query_as(
             r#"
-            SELECT entry_date, status, created_at, posted_at, revision
+            SELECT entry_date, status, created_at, posted_at, revision,
+                   reverses_entry_id, corrects_entry_id, explanation, reference
             FROM journal_entries
             WHERE id = ?
             "#,
@@ -626,6 +880,12 @@ impl JournalRepository {
         let Some(header) = header else {
             return Err(JournalError::EntryNotFound(id.get()));
         };
+        validate_stored_header_state(
+            id,
+            &header.status,
+            header.revision,
+            header.posted_at.as_deref(),
+        )?;
         if header.status != "posted" {
             return Err(JournalError::EntryNotPosted(id.get()));
         }
@@ -635,9 +895,9 @@ impl JournalRepository {
                 id.get()
             ))
         })?;
+        validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
         let entry_date = parse_stored_date(id, &header.entry_date)?;
         let stored_lines = load_stored_lines(&mut transaction, id).await?;
-        transaction.commit().await.map_err(JournalError::Database)?;
         let validation_lines = stored_lines_to_inputs(id, &stored_lines)?;
         validate_journal_lines(&validation_lines).map_err(|error| {
             JournalError::InvalidStoredValue(format!(
@@ -647,13 +907,25 @@ impl JournalRepository {
         })?;
 
         let lines = stored_lines_to_posted(id, stored_lines)?;
-        Ok(PostedJournalEntry {
+        let relationship = decode_stored_relationship(
+            id,
+            header.reverses_entry_id,
+            header.corrects_entry_id,
+            header.explanation.as_deref(),
+        )?;
+        let posted = PostedJournalEntry {
             id,
             entry_date,
             created_at: header.created_at,
             posted_at,
+            relationship,
+            reference: header.reference,
+            explanation: header.explanation,
             lines,
-        })
+        };
+        validate_loaded_relationship(&mut transaction, &posted).await?;
+        transaction.commit().await.map_err(JournalError::Database)?;
+        Ok(posted)
     }
 }
 
@@ -664,6 +936,21 @@ struct StoredJournalHeader {
     created_at: String,
     posted_at: Option<String>,
     revision: i64,
+    reference: Option<String>,
+    explanation: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPostedHeader {
+    entry_date: String,
+    status: String,
+    created_at: String,
+    posted_at: Option<String>,
+    revision: i64,
+    reverses_entry_id: Option<i64>,
+    corrects_entry_id: Option<i64>,
+    explanation: Option<String>,
+    reference: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -673,6 +960,19 @@ struct StoredJournalLine {
     account_id: i64,
     side: String,
     amount_minor: i64,
+    memo: Option<String>,
+    account_exists: bool,
+    account_is_posting_leaf: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StoredDraftListHeader {
+    id: i64,
+    entry_date: String,
+    revision: i64,
+    created_at: String,
+    reference: Option<String>,
+    explanation: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -683,9 +983,314 @@ struct StoredDraftListLine {
     account_id: i64,
     side: String,
     amount_minor: i64,
+    memo: Option<String>,
+    account_exists: bool,
+    account_is_posting_leaf: bool,
+}
+
+async fn insert_and_post(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: PostEntry,
+    relationship: PostedEntryRelationship,
+    explanation: Option<String>,
+) -> Result<PostedJournalEntry, JournalError> {
+    validate_draft_lines(&input.lines)?;
+    validate_journal_lines(&input.lines)?;
+    let explanation = explanation.or(input.explanation);
+    validate_metadata(input.reference.as_deref(), explanation.as_deref())?;
+    let (reverses_entry_id, corrects_entry_id) = match relationship {
+        PostedEntryRelationship::Ordinary => (None, None),
+        PostedEntryRelationship::Reversal { original_entry_id } => {
+            (Some(original_entry_id.get()), None)
+        }
+        PostedEntryRelationship::Correction { original_entry_id } => {
+            (None, Some(original_entry_id.get()))
+        }
+    };
+    let (entry_id, created_at): (i64, String) = sqlx::query_as(
+        r#"
+        INSERT INTO journal_entries (
+            entry_date, reverses_entry_id, corrects_entry_id, explanation, reference
+        )
+        VALUES (?, ?, ?, ?, ?)
+        RETURNING id, created_at
+        "#,
+    )
+    .bind(input.entry_date.as_str())
+    .bind(reverses_entry_id)
+    .bind(corrects_entry_id)
+    .bind(explanation.as_deref())
+    .bind(input.reference.as_deref())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(JournalError::Database)?;
+
+    let mut posted_lines = Vec::with_capacity(input.lines.len());
+    for (line_index, line) in input.lines.iter().enumerate() {
+        require_postable_account(transaction, line.account_id).await?;
+        let line_no = i64::try_from(line_index + 1).map_err(|_| JournalError::TooManyLines)?;
+        let line_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO journal_lines (
+                entry_id, line_no, account_id, side, amount_minor, memo
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
+            "#,
+        )
+        .bind(entry_id)
+        .bind(line_no)
+        .bind(line.account_id.get())
+        .bind(line.side.as_str())
+        .bind(line.amount.get())
+        .bind(line.memo.as_deref())
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(JournalError::Database)?;
+        posted_lines.push(PostedJournalLine {
+            id: JournalLineId::new(line_id),
+            line_no,
+            account_id: line.account_id,
+            side: line.side,
+            amount: line.amount,
+            memo: line.memo.clone(),
+        });
+    }
+
+    let posted_at: String = sqlx::query_scalar(
+        r#"
+        UPDATE journal_entries
+        SET status = 'posted',
+            posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            revision = revision + 1
+        WHERE id = ?
+          AND status = 'draft'
+          AND posted_at IS NULL
+          AND revision = 1
+        RETURNING posted_at
+        "#,
+    )
+    .bind(entry_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(JournalError::Database)?;
+
+    Ok(PostedJournalEntry {
+        id: JournalEntryId::new(entry_id),
+        entry_date: input.entry_date,
+        created_at,
+        posted_at,
+        relationship,
+        reference: input.reference,
+        explanation,
+        lines: posted_lines,
+    })
+}
+
+async fn load_posted_for_relationship(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: JournalEntryId,
+) -> Result<PostedJournalEntry, JournalError> {
+    let header: Option<StoredPostedHeader> = sqlx::query_as(
+        r#"
+        SELECT entry_date, status, created_at, posted_at, revision,
+               reverses_entry_id, corrects_entry_id, explanation, reference
+        FROM journal_entries
+        WHERE id = ?
+        "#,
+    )
+    .bind(id.get())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(JournalError::Database)?;
+    let Some(header) = header else {
+        return Err(JournalError::EntryNotFound(id.get()));
+    };
+    validate_stored_header_state(
+        id,
+        &header.status,
+        header.revision,
+        header.posted_at.as_deref(),
+    )?;
+    if header.status != "posted" {
+        return Err(JournalError::EntryNotPosted(id.get()));
+    }
+    let posted_at = header.posted_at.ok_or_else(|| {
+        JournalError::InvalidStoredValue(format!(
+            "posted entry {} has no posting timestamp",
+            id.get()
+        ))
+    })?;
+    validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
+    let stored_lines = load_stored_lines(transaction, id).await?;
+    let validation_lines = stored_lines_to_inputs(id, &stored_lines)?;
+    validate_journal_lines(&validation_lines).map_err(|error| {
+        JournalError::InvalidStoredValue(format!(
+            "entry {} failed line validation: {error}",
+            id.get()
+        ))
+    })?;
+    let relationship = decode_stored_relationship(
+        id,
+        header.reverses_entry_id,
+        header.corrects_entry_id,
+        header.explanation.as_deref(),
+    )?;
+    let posted = PostedJournalEntry {
+        id,
+        entry_date: parse_stored_date(id, &header.entry_date)?,
+        created_at: header.created_at,
+        posted_at,
+        relationship,
+        reference: header.reference,
+        explanation: header.explanation,
+        lines: stored_lines_to_posted(id, stored_lines)?,
+    };
+    validate_loaded_relationship(transaction, &posted).await?;
+    Ok(posted)
+}
+
+fn decode_stored_relationship(
+    id: JournalEntryId,
+    reverses_entry_id: Option<i64>,
+    corrects_entry_id: Option<i64>,
+    explanation: Option<&str>,
+) -> Result<PostedEntryRelationship, JournalError> {
+    if explanation.is_some_and(|value| value.contains('\0')) {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} explanation contains a null character",
+            id.get()
+        )));
+    }
+    match (reverses_entry_id, corrects_entry_id) {
+        (None, None) => Ok(PostedEntryRelationship::Ordinary),
+        (Some(original), None) if original > 0 && original != id.get() => {
+            Ok(PostedEntryRelationship::Reversal {
+                original_entry_id: JournalEntryId::new(original),
+            })
+        }
+        (None, Some(original)) if original > 0 && original != id.get() => {
+            if explanation.is_none_or(|value| value.trim().is_empty()) {
+                return Err(JournalError::InvalidStoredValue(format!(
+                    "correcting entry {} has no explanation",
+                    id.get()
+                )));
+            }
+            Ok(PostedEntryRelationship::Correction {
+                original_entry_id: JournalEntryId::new(original),
+            })
+        }
+        (Some(_), Some(_)) => Err(JournalError::InvalidStoredValue(format!(
+            "entry {} is both a reversal and a correction",
+            id.get()
+        ))),
+        _ => Err(JournalError::InvalidStoredValue(format!(
+            "entry {} has an invalid related entry identifier",
+            id.get()
+        ))),
+    }
+}
+
+async fn validate_loaded_relationship(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    entry: &PostedJournalEntry,
+) -> Result<(), JournalError> {
+    let original_id = match entry.relationship {
+        PostedEntryRelationship::Ordinary => return Ok(()),
+        PostedEntryRelationship::Reversal { original_entry_id }
+        | PostedEntryRelationship::Correction { original_entry_id } => original_entry_id,
+    };
+    let original: Option<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT entry_date, status, reverses_entry_id FROM journal_entries WHERE id = ?",
+    )
+    .bind(original_id.get())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(JournalError::Database)?;
+    let Some((original_date, status, original_reverses)) = original else {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} refers to missing entry {}",
+            entry.id.get(),
+            original_id.get()
+        )));
+    };
+    if status != "posted" {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} refers to non-posted entry {}",
+            entry.id.get(),
+            original_id.get()
+        )));
+    }
+    if !matches!(entry.relationship, PostedEntryRelationship::Reversal { .. }) {
+        return Ok(());
+    }
+    if original_reverses.is_some() {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "reversal {} reverses another reversal {}",
+            entry.id.get(),
+            original_id.get()
+        )));
+    }
+    let original_date = parse_stored_date(original_id, &original_date)?;
+    if entry.entry_date < original_date {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "reversal {} predates original entry {}",
+            entry.id.get(),
+            original_id.get()
+        )));
+    }
+    let original_lines = load_stored_lines(transaction, original_id).await?;
+    let original_lines = stored_lines_to_inputs(original_id, &original_lines)?;
+    if entry.lines.len() != original_lines.len()
+        || entry
+            .lines
+            .iter()
+            .zip(original_lines)
+            .any(|(reversal, original)| {
+                reversal.account_id != original.account_id
+                    || reversal.amount != original.amount
+                    || reversal.side == original.side
+            })
+    {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "reversal {} does not exactly exchange original entry {} sides",
+            entry.id.get(),
+            original_id.get()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_explanation(explanation: &str) -> Result<(), JournalError> {
+    if explanation.contains('\0') {
+        return Err(JournalError::InvalidExplanation);
+    }
+    if explanation.trim().is_empty() {
+        return Err(JournalError::CorrectionExplanationRequired);
+    }
+    Ok(())
+}
+
+fn validate_metadata(
+    reference: Option<&str>,
+    explanation: Option<&str>,
+) -> Result<(), JournalError> {
+    if reference.is_some_and(|text| text.contains('\0')) {
+        return Err(JournalError::InvalidMetadata);
+    }
+    if explanation.is_some_and(|text| text.contains('\0')) {
+        return Err(JournalError::InvalidExplanation);
+    }
+    Ok(())
 }
 
 fn validate_draft_lines(lines: &[JournalLineInput]) -> Result<(), JournalError> {
+    if lines
+        .iter()
+        .any(|line| line.memo.as_deref().is_some_and(|text| text.contains('\0')))
+    {
+        return Err(JournalError::InvalidMetadata);
+    }
     i64::try_from(lines.len()).map_err(|_| JournalError::TooManyLines)?;
     for (line_index, line) in lines.iter().enumerate() {
         if line.amount <= MinorUnits::ZERO {
@@ -706,8 +1311,8 @@ async fn insert_draft_lines(
         let line_no = i64::try_from(line_index + 1).map_err(|_| JournalError::TooManyLines)?;
         let line_id: i64 = sqlx::query_scalar(
             r#"
-            INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO journal_lines (entry_id, line_no, account_id, side, amount_minor, memo)
+            VALUES (?, ?, ?, ?, ?, ?)
             RETURNING id
             "#,
         )
@@ -716,6 +1321,7 @@ async fn insert_draft_lines(
         .bind(line.account_id.get())
         .bind(line.side.as_str())
         .bind(line.amount.get())
+        .bind(line.memo.as_deref())
         .fetch_one(&mut **transaction)
         .await
         .map_err(JournalError::Database)?;
@@ -725,6 +1331,7 @@ async fn insert_draft_lines(
             account_id: line.account_id,
             side: line.side,
             amount: line.amount,
+            memo: line.memo.clone(),
         });
     }
     Ok(saved)
@@ -736,10 +1343,29 @@ async fn load_stored_lines(
 ) -> Result<Vec<StoredJournalLine>, JournalError> {
     sqlx::query_as(
         r#"
-        SELECT id, line_no, account_id, side, amount_minor
-        FROM journal_lines
-        WHERE entry_id = ?
-        ORDER BY line_no, id
+        SELECT line.id,
+               line.line_no,
+               line.account_id,
+               line.side,
+               line.amount_minor,
+               line.memo,
+               EXISTS(
+                   SELECT 1 FROM accounts AS account
+                   WHERE account.id = line.account_id
+               ) AS account_exists,
+               EXISTS(
+                   SELECT 1
+                   FROM accounts AS account
+                   WHERE account.id = line.account_id
+                     AND account.kind = 'posting'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM accounts AS child
+                         WHERE child.parent_id = account.id
+                     )
+               ) AS account_is_posting_leaf
+        FROM journal_lines AS line
+        WHERE line.entry_id = ?
+        ORDER BY line.line_no, line.id
         "#,
     )
     .bind(id.get())
@@ -752,8 +1378,9 @@ async fn load_draft_lines(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: JournalEntryId,
 ) -> Result<Vec<DraftJournalLine>, JournalError> {
-    load_stored_lines(transaction, id)
-        .await?
+    let stored_lines = load_stored_lines(transaction, id).await?;
+    validate_stored_line_order(id, &stored_lines)?;
+    stored_lines
         .into_iter()
         .map(|stored| {
             let (account_id, side, amount) = stored_line_values(id, &stored)?;
@@ -763,6 +1390,7 @@ async fn load_draft_lines(
                 account_id,
                 side,
                 amount,
+                memo: stored.memo,
             })
         })
         .collect()
@@ -772,11 +1400,17 @@ fn stored_lines_to_inputs(
     id: JournalEntryId,
     lines: &[StoredJournalLine],
 ) -> Result<Vec<JournalLineInput>, JournalError> {
+    validate_stored_line_order(id, lines)?;
     lines
         .iter()
         .map(|stored| {
             let (account_id, side, amount) = stored_line_values(id, stored)?;
-            Ok(JournalLineInput::new(account_id, side, amount))
+            Ok(JournalLineInput {
+                account_id,
+                side,
+                amount,
+                memo: stored.memo.clone(),
+            })
         })
         .collect()
 }
@@ -785,6 +1419,7 @@ fn stored_lines_to_posted(
     id: JournalEntryId,
     lines: Vec<StoredJournalLine>,
 ) -> Result<Vec<PostedJournalLine>, JournalError> {
+    validate_stored_line_order(id, &lines)?;
     lines
         .into_iter()
         .map(|stored| {
@@ -795,15 +1430,88 @@ fn stored_lines_to_posted(
                 account_id,
                 side,
                 amount,
+                memo: stored.memo,
             })
         })
         .collect()
+}
+
+fn validate_stored_line_order(
+    entry_id: JournalEntryId,
+    lines: &[StoredJournalLine],
+) -> Result<(), JournalError> {
+    for (index, line) in lines.iter().enumerate() {
+        let expected = i64::try_from(index + 1).map_err(|_| {
+            JournalError::InvalidStoredValue(format!(
+                "entry {} has more lines than SQLite can number",
+                entry_id.get()
+            ))
+        })?;
+        if line.line_no != expected {
+            return Err(JournalError::InvalidStoredValue(format!(
+                "entry {} line {} expected line number {expected}, found {}",
+                entry_id.get(),
+                line.id,
+                line.line_no
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn stored_line_values(
     entry_id: JournalEntryId,
     stored: &StoredJournalLine,
 ) -> Result<(AccountId, JournalSide, MinorUnits), JournalError> {
+    if stored
+        .memo
+        .as_deref()
+        .is_some_and(|text| text.contains('\0'))
+    {
+        return Err(JournalError::InvalidStoredValue(
+            "line memo contains a null character".to_owned(),
+        ));
+    }
+
+    if stored.id <= 0 {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} has non-positive line identifier {}",
+            entry_id.get(),
+            stored.id
+        )));
+    }
+    if stored.account_id <= 0 {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} line {} has non-positive account identifier {}",
+            entry_id.get(),
+            stored.id,
+            stored.account_id
+        )));
+    }
+    if !stored.account_exists {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} line {} refers to missing account {}",
+            entry_id.get(),
+            stored.id,
+            stored.account_id
+        )));
+    }
+    if !stored.account_is_posting_leaf {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} line {} refers to non-posting-leaf account {}",
+            entry_id.get(),
+            stored.id,
+            stored.account_id
+        )));
+    }
+    if stored.amount_minor <= 0 {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} line {} has non-positive amount {}",
+            entry_id.get(),
+            stored.id,
+            stored.amount_minor
+        )));
+    }
     let side = match stored.side.as_str() {
         "debit" => JournalSide::Debit,
         "credit" => JournalSide::Credit,
@@ -829,19 +1537,69 @@ fn parse_stored_date(id: JournalEntryId, stored: &str) -> Result<JournalDate, Jo
     })
 }
 
+fn validate_stored_header_state(
+    id: JournalEntryId,
+    status: &str,
+    revision: i64,
+    posted_at: Option<&str>,
+) -> Result<(), JournalError> {
+    if !matches!(status, "draft" | "posted") {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} has invalid status {status}",
+            id.get()
+        )));
+    }
+    if revision < 1 {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} has invalid revision {revision}",
+            id.get()
+        )));
+    }
+    if status == "posted" && revision < 2 {
+        return Err(JournalError::InvalidStoredValue(format!(
+            "entry {} has invalid posted revision {revision}",
+            id.get()
+        )));
+    }
+    match (status, posted_at) {
+        ("draft", Some(_)) => Err(JournalError::InvalidStoredValue(format!(
+            "draft entry {} unexpectedly has a posting timestamp",
+            id.get()
+        ))),
+        ("posted", None) => Err(JournalError::InvalidStoredValue(format!(
+            "posted entry {} has no posting timestamp",
+            id.get()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 async fn entry_not_draft_error(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: JournalEntryId,
     expected_revision: Option<i64>,
 ) -> Result<JournalError, JournalError> {
-    let state: Option<(String, i64)> =
-        sqlx::query_as("SELECT status, revision FROM journal_entries WHERE id = ?")
+    let state: Option<(String, i64, Option<String>)> =
+        sqlx::query_as("SELECT status, revision, posted_at FROM journal_entries WHERE id = ?")
             .bind(id.get())
             .fetch_optional(&mut **transaction)
             .await
             .map_err(JournalError::Database)?;
+    if let Some((status, revision, posted_at)) = &state
+        && let Err(error) =
+            validate_stored_header_state(id, status, *revision, posted_at.as_deref())
+    {
+        return Ok(error);
+    }
     Ok(match (state, expected_revision) {
-        (Some((status, actual_revision)), Some(expected_revision))
+        (Some((status, actual_revision, _)), Some(expected_revision))
+            if status == "draft"
+                && expected_revision == actual_revision
+                && actual_revision == i64::MAX =>
+        {
+            JournalError::DraftRevisionExhausted(id.get())
+        }
+        (Some((status, actual_revision, _)), Some(expected_revision))
             if status == "draft" && expected_revision != actual_revision =>
         {
             JournalError::StaleDraftRevision {
@@ -853,6 +1611,48 @@ async fn entry_not_draft_error(
         (Some(_), _) => JournalError::EntryNotDraft(id.get()),
         (None, _) => JournalError::EntryNotFound(id.get()),
     })
+}
+
+async fn validate_stored_draft_for_mutation(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: JournalEntryId,
+    expected_revision: i64,
+    advances_revision: bool,
+) -> Result<(), JournalError> {
+    let header: Option<StoredPostedHeader> = sqlx::query_as(
+        r#"
+        SELECT entry_date, status, created_at, revision, posted_at, reference, explanation, reverses_entry_id, corrects_entry_id
+        FROM journal_entries
+        WHERE id = ?
+        "#,
+    )
+    .bind(id.get())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(JournalError::Database)?;
+    let Some(header) = header else {
+        return Err(JournalError::EntryNotFound(id.get()));
+    };
+    let revision = header.revision;
+    validate_stored_header_state(id, &header.status, revision, header.posted_at.as_deref())?;
+    if header.status != "draft" {
+        return Err(JournalError::EntryNotDraft(id.get()));
+    }
+    if revision != expected_revision {
+        return Err(JournalError::StaleDraftRevision {
+            id: id.get(),
+            expected_revision,
+            actual_revision: revision,
+        });
+    }
+    if advances_revision && revision == i64::MAX {
+        return Err(JournalError::DraftRevisionExhausted(id.get()));
+    }
+
+    validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
+    parse_stored_date(id, &header.entry_date)?;
+    load_draft_lines(transaction, id).await?;
+    Ok(())
 }
 
 /// Validates the arithmetic invariants required before posting.
@@ -942,4 +1742,348 @@ fn parse_date_part(bytes: &[u8]) -> u32 {
 
 const fn is_leap_year(year: u32) -> bool {
     year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_memory_database;
+
+    #[tokio::test]
+    async fn replace_and_delete_do_not_hide_a_corrupt_stored_draft() {
+        let pool = open_memory_database().await.expect("database should open");
+        let journal = JournalRepository::new(pool.clone());
+        let draft = journal
+            .create_draft(SaveDraftEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE journal_entries SET entry_date = 'not-a-date', revision = revision + 1 WHERE id = ?",
+        )
+        .bind(draft.id.get())
+        .execute(&pool)
+        .await
+        .expect("test setup should simulate a bypassed date constraint");
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let corrupted_revision = draft.revision + 1;
+
+        let replace_error = journal
+            .replace_draft(
+                draft.id,
+                corrupted_revision,
+                SaveDraftEntry::new(JournalDate::parse("2026-10-23").unwrap(), vec![]),
+            )
+            .await
+            .expect_err("replacement must not silently repair a corrupt stored date");
+        assert!(
+            matches!(replace_error, JournalError::InvalidStoredValue(message) if message.contains("invalid date not-a-date"))
+        );
+
+        let delete_error = journal
+            .delete_draft(draft.id, corrupted_revision)
+            .await
+            .expect_err("deletion must not silently erase a corrupt stored draft");
+        assert!(
+            matches!(delete_error, JournalError::InvalidStoredValue(message) if message.contains("invalid date not-a-date"))
+        );
+
+        let stored: (String, String, i64) =
+            sqlx::query_as("SELECT entry_date, status, revision FROM journal_entries WHERE id = ?")
+                .bind(draft.id.get())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "not-a-date".to_owned(),
+                "draft".to_owned(),
+                corrupted_revision
+            )
+        );
+
+        let account_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (name, element, kind) VALUES ('測試帳戶', 'asset', 'posting') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let malformed_lines = journal
+            .create_draft(SaveDraftEntry::new(
+                JournalDate::parse("2026-10-24").unwrap(),
+                vec![JournalLineInput::new(
+                    AccountId::new(account_id),
+                    JournalSide::Debit,
+                    MinorUnits::new(100),
+                )],
+            ))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE journal_lines SET line_no = 2 WHERE id = ?")
+            .bind(malformed_lines.lines[0].id.get())
+            .execute(&pool)
+            .await
+            .expect("test setup should create a gap in the stored line sequence");
+
+        for mutation_error in [
+            journal
+                .replace_draft(
+                    malformed_lines.id,
+                    malformed_lines.revision,
+                    SaveDraftEntry::new(JournalDate::parse("2026-10-25").unwrap(), vec![]),
+                )
+                .await
+                .expect_err("replacement must not hide malformed stored lines"),
+            journal
+                .delete_draft(malformed_lines.id, malformed_lines.revision)
+                .await
+                .expect_err("deletion must not erase malformed stored lines"),
+        ] {
+            assert!(
+                matches!(mutation_error, JournalError::InvalidStoredValue(message) if message.contains("expected line number 1, found 2"))
+            );
+        }
+        let malformed_line_no: i64 =
+            sqlx::query_scalar("SELECT line_no FROM journal_lines WHERE entry_id = ?")
+                .bind(malformed_lines.id.get())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(malformed_line_no, 2);
+    }
+
+    #[tokio::test]
+    async fn posted_read_rejects_an_impossible_initial_revision() {
+        let pool = open_memory_database().await.expect("database should open");
+        let journal = JournalRepository::new(pool.clone());
+        let cash_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (name, element, kind) VALUES ('現金', 'asset', 'posting') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let revenue_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (name, element, kind) VALUES ('收入', 'income', 'posting') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let posted = journal
+            .post(PostEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                vec![
+                    JournalLineInput::new(
+                        AccountId::new(cash_id),
+                        JournalSide::Debit,
+                        MinorUnits::new(100),
+                    ),
+                    JournalLineInput::new(
+                        AccountId::new(revenue_id),
+                        JournalSide::Credit,
+                        MinorUnits::new(100),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TRIGGER journal_entries_posted_immutable_update")
+            .execute(&pool)
+            .await
+            .expect("test setup should bypass posted immutability");
+        sqlx::query("UPDATE journal_entries SET revision = 1 WHERE id = ?")
+            .bind(posted.id.get())
+            .execute(&pool)
+            .await
+            .expect("test setup should simulate an impossible posted revision");
+
+        let error = journal
+            .get_posted(posted.id)
+            .await
+            .expect_err("a posted entry cannot still have its initial draft revision");
+        assert!(
+            matches!(error, JournalError::InvalidStoredValue(message) if message.contains("invalid posted revision 1"))
+        );
+        assert!(
+            matches!(journal.list_drafts().await, Err(JournalError::InvalidStoredValue(message)) if message.contains("invalid posted revision 1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_operations_reject_an_orphaned_stored_account_reference() {
+        let pool = open_memory_database().await.expect("database should open");
+        let journal = JournalRepository::new(pool.clone());
+        let account_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (name, element, kind) VALUES ('現金', 'asset', 'posting') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let draft = journal
+            .create_draft(SaveDraftEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                vec![JournalLineInput::new(
+                    AccountId::new(account_id),
+                    JournalSide::Debit,
+                    MinorUnits::new(100),
+                )],
+            ))
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TRIGGER journal_lines_validate_account_update")
+            .execute(&pool)
+            .await
+            .expect("test setup should bypass account eligibility validation");
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE journal_lines SET account_id = 999999 WHERE id = ?")
+            .bind(draft.lines[0].id.get())
+            .execute(&pool)
+            .await
+            .expect("test setup should simulate an orphaned line account");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let read_error = journal
+            .get_draft(draft.id)
+            .await
+            .expect_err("an orphaned account reference must not be returned");
+        assert!(
+            matches!(read_error, JournalError::InvalidStoredValue(message) if message.contains("missing account 999999"))
+        );
+        for mutation_error in [
+            journal
+                .replace_draft(
+                    draft.id,
+                    draft.revision,
+                    SaveDraftEntry::new(JournalDate::parse("2026-10-23").unwrap(), vec![]),
+                )
+                .await
+                .expect_err("replacement must not hide an orphaned account reference"),
+            journal
+                .delete_draft(draft.id, draft.revision)
+                .await
+                .expect_err("deletion must not erase an orphaned account reference"),
+        ] {
+            assert!(
+                matches!(mutation_error, JournalError::InvalidStoredValue(message) if message.contains("missing account 999999"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_operations_reject_a_corrupted_non_posting_account_reference() {
+        let pool = open_memory_database().await.expect("database should open");
+        let journal = JournalRepository::new(pool.clone());
+        let account_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (name, element, kind) VALUES ('現金', 'asset', 'posting') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let draft = journal
+            .create_draft(SaveDraftEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                vec![JournalLineInput::new(
+                    AccountId::new(account_id),
+                    JournalSide::Debit,
+                    MinorUnits::new(100),
+                )],
+            ))
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TRIGGER accounts_preserve_journal_classification")
+            .execute(&pool)
+            .await
+            .expect("test setup should bypass journal classification immutability");
+        sqlx::query("UPDATE accounts SET kind = 'category', revision = revision + 1 WHERE id = ?")
+            .bind(account_id)
+            .execute(&pool)
+            .await
+            .expect("test setup should simulate a reclassified referenced account");
+
+        for error in [
+            journal.get_draft(draft.id).await.unwrap_err(),
+            journal
+                .replace_draft(
+                    draft.id,
+                    draft.revision,
+                    SaveDraftEntry::new(JournalDate::parse("2026-10-23").unwrap(), vec![]),
+                )
+                .await
+                .unwrap_err(),
+            journal
+                .delete_draft(draft.id, draft.revision)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, JournalError::InvalidStoredValue(message) if message.contains("non-posting-leaf account"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_replace_reports_the_current_revision_before_validating_new_lines() {
+        let pool = open_memory_database().await.expect("database should open");
+        let journal = JournalRepository::new(pool);
+        let original = journal
+            .create_draft(SaveDraftEntry::new(
+                JournalDate::parse("2026-10-22").unwrap(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let current = journal
+            .replace_draft(
+                original.id,
+                original.revision,
+                SaveDraftEntry::new(JournalDate::parse("2026-10-23").unwrap(), vec![]),
+            )
+            .await
+            .unwrap();
+
+        let error = journal
+            .replace_draft(
+                original.id,
+                original.revision,
+                SaveDraftEntry::new(
+                    JournalDate::parse("2026-10-24").unwrap(),
+                    vec![JournalLineInput::new(
+                        AccountId::new(999_999),
+                        JournalSide::Debit,
+                        MinorUnits::ZERO,
+                    )],
+                ),
+            )
+            .await
+            .expect_err("a stale client must receive the current revision first");
+        assert!(matches!(
+            error,
+            JournalError::StaleDraftRevision {
+                id,
+                expected_revision,
+                actual_revision,
+            } if id == original.id.get()
+                && expected_revision == original.revision
+                && actual_revision == current.revision
+        ));
+    }
 }

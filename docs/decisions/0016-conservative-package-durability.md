@@ -40,3 +40,8 @@ Some removable-drive file systems may be rejected even when ordinary Finder
 copying appears to work. This is intentional: compatibility cannot take
 priority over preserving the only valid accounting book. Supported removable
 file systems still require explicit compatibility testing and documentation.
+
+When this publisher is used by the durable export workflow, the state changes
+to `published_unverified` immediately after the exclusive rename and changes to
+`verified` only after parent synchronization and the public package audit.
+ADRs 0020–0021 define persistence and restart handling for those boundaries.

@@ -44,6 +44,6 @@ primitive must not be described as proving database-reference completeness.
 ## Consequences
 
 The backend can now safely prepare real transfer input without adopting an
-attachment ownership policy. The next integration step is to allocate this
-local staging automatically, feed it into the conservative staged-export
-workflow, and preserve a durable operation record across interruption.
+attachment ownership policy. ADR 0019 composes it with conservative export,
+and ADR 0020–0021 preserve and recover the durable operation record across
+interruption.

@@ -35,3 +35,17 @@ backups/
 .idea/
 .vscode/
 
+# Encrypted runtime objects, local backups, and private work
+*.kae
+*.kabackup/
+.kAccounting-Extra-01-encrypted-backup-*.work/
+device-key.json
+
+# Runtime coordination and local Python caches
+*.managed/
+.runtime.lock
+.maintenance.lock
+.backup-service.lock
+.kAccounting-Extra-01-init-*/
+__pycache__/
+*.pyc

@@ -5,7 +5,7 @@ Status: draft
 ## Deployment model
 
 ```text
-Mac/iPad Safari
+Mac Safari (Version 01)
       |
  private Tailscale network (HTTPS)
       |
@@ -19,6 +19,8 @@ Mac/iPad Safari
 ```
 
 The application is available only while the Mac Studio is powered on and the user is logged in. Public Funnel access is prohibited.
+The touch-friendly iPad Safari client is deferred to Version 02 and does not
+gate the Version 01 release.
 
 ## Components
 
@@ -38,11 +40,15 @@ Planned modules:
 
 HTTP handlers must not contain the authoritative accounting rules. Domain operations and database constraints should defend the invariants independently.
 
-The current Axum router is read-only and is exercised in-process by tests. It
-does not open a listener. JSON encodes SQLite identifiers, revisions, line
+The default Axum router remains read-only. An explicit localhost write router
+adds tested account/journal mutations with Host/Origin protection. Both are
+exercised in-process and neither opens a listener. JSON encodes SQLite identifiers, revisions, line
 numbers, and monetary amounts as decimal strings so JavaScript cannot round
-exact values. Authentication and the localhost-only serving boundary must be
-decided before mutation routes or a listener are added.
+exact values. The runtime now opens only an explicitly selected existing book,
+loads its bound Keychain key, holds an exclusive process lock, audits the schema
+before writable opening, and serves the guarded application at the fixed
+loopback address. Static assets have the same Host/Origin boundary and a CSP.
+Private Tailscale identity/origin integration remains pending.
 
 The account implementation currently uses four integrity layers:
 
@@ -56,12 +62,17 @@ Before enabling WAL or migrating a file, the database layer accepts only an empt
 ## Data model status
 
 - `accounts`: initial migration and Rust repository implemented; see `DATABASE_SCHEMA.md`.
-- `journal_entries`: minimal date/state/timestamp header plus monotonic draft revision implemented for safe draft editing and atomic posting; presentation-specific header fields remain deferred.
+- `journal_entries`: minimal date/state/timestamp header plus monotonic draft revision implemented for safe draft editing and atomic posting; optional reference and explanation fields are implemented.
 - `journal_lines`: exact integer amount, debit/credit side, stable account reference, and immutable posted-line behavior implemented.
+- `journal_entries`: immutable reversal/correction relationships and atomic
+  forward-only correction behavior implemented; reference/explanation/line-memo metadata is now implemented.
 - `accounting_periods`
 - `settings`
 
-The account model, persistent user-editable drafts, and policy-neutral posting subset of the journal model have entered implementation. Reversals/corrections, periods, and settings remain candidates whose fields, state transitions, and policies require dedicated review.
+The account model, persistent user-editable drafts, posting, and immutable
+reversal/correction subset of the journal model are implemented. Explicit
+book/key startup is implemented; automatic active-book selection remains.
+Version 01 explicitly excludes period closing/locking.
 
 ## Data locations
 
@@ -69,12 +80,26 @@ The account model, persistent user-editable drafts, and policy-neutral posting s
 - Live runtime book: outside the repository on the Mac's local storage under
   macOS Application Support. It contains the runtime database and attachment
   store and is not opened directly from removable storage in Version 01.
+- Live attachment objects, application-managed backups, and `.kagextra`
+  payloads are encrypted at rest by the application. Plaintext intermediate
+  artifacts must not be published or retained after failure. ADR 0023 defines
+  the encrypted-object format and algorithms. ADR 0024 prohibits application
+  passwords and defines Keychain-backed device keys plus destination public-key
+  wrapping for passwordless transfer; integration remains to be completed.
 - Runtime database and SQLite sidecars: owner read/write only (`0600`) after application identity is accepted.
-- Proposed directory name: `kAccounting-Extra-01`; the final path must be confirmed before deployment.
+- Approved runtime root: `~/Library/Application Support/kAccounting-Extra-01/`;
+  explicit initialization/opening is available. See `LOCAL_RUNTIME.md`.
 - Backups and `.kagextra` transfer exports: outside the source tree and never
   committed.
 
-The application owns the supported transfer workflow. The `.kagextra` artifact
+The application owns the supported transfer workflow. The older plaintext
+structural transfer foundation described below is not the approved encrypted
+Version 01 delivery format and is not exposed by application commands. Strict
+recipient requests, HPKE key envelopes, and bounded-memory attachment
+re-encryption are now separate tested primitives; complete encrypted package
+publication and import remain unimplemented.
+
+The `.kagextra` artifact
 is a macOS directory package that Finder may present as one document, not a
 true single file. Its top level contains strict UTF-8 `manifest.json`, the
 verified `book.sqlite3` snapshot, and `attachments/`. The old Mac creates a
@@ -103,3 +128,16 @@ that rejects a required synchronization step is not treated as successful.
 - Derive balances and reports from posted lines.
 - Back up through a database-consistent mechanism rather than copying a live database unsafely.
 
+
+## Implemented encrypted local storage additions
+
+See ADRs 0027–0029 for the immutable encrypted attachment repository,
+create-only/read-only Keychain boundary, and encrypted local `.kabackup`
+backup/restore protocol. The snapshot's own database references select all
+attachments automatically. Verified restore publishes a new local destination
+without switching the active book. Local backup is separate from the pending
+passwordless recipient-key `.kagextra` transfer integration.
+
+The application must run marked/locked private backup work recovery at startup.
+Physical attachment garbage collection remains disabled until snapshot readers
+are pinned. No runtime or complete write UI is enabled by these foundations.

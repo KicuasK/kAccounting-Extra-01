@@ -3,7 +3,9 @@
 ## Scope
 
 - Preserve the exact project name `kAccounting-Extra-01`.
-- Build a private, single-user double-entry accounting MVP for macOS, Mac Safari, and iPad Safari.
+- Build a private, single-user double-entry accounting MVP for macOS and Mac
+  Safari in Version 01; defer the touch-friendly iPad Safari interface to
+  Version 02.
 - Treat IFRS concepts as design guidance; do not claim full IFRS reporting compliance.
 - Keep source code separate from runtime financial data.
 
@@ -25,7 +27,8 @@
 - Use `system-ui` for all UI text except Chinese characters inside account names, which use `DFKai-SB` with a safe fallback.
 - Keep English, digits, dates, and amounts in account names in the system font.
 - Right-align amounts and use tabular numerals.
-- Support Mac Safari and touch-friendly iPad Safari. iPhone support is out of scope.
+- Support Mac Safari in Version 01. Preserve responsive foundations for the
+  touch-friendly iPad Safari Version 02; iPhone support is out of scope.
 - Use the traditional General Journal reference recorded in `docs/UI_STYLE_GUIDE.md` for entry structure.
 
 ## Boundaries

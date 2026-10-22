@@ -18,6 +18,13 @@ required prefix of at least one declared attachment path. Symlinks, special
 filesystem objects, non-UTF-8 names, undeclared files, unexpected directories,
 and extra top-level entries are rejected.
 
+The manifest name must identify the same regular non-symlink file before,
+during, and after it is opened and read. A concurrent replacement is rejected
+rather than following a newly introduced symlink or validating bytes that no
+longer belong to the package entry. The loader reads it again after the complete
+layout, object, and database audit and rejects any byte change, so one result
+cannot combine an earlier manifest with later package contents.
+
 Only after the physical layout passes does the loader invoke the existing
 staged-transfer verifier. That verifier recomputes every declared length and
 SHA-256 digest and independently audits the SQLite snapshot's application
@@ -34,5 +41,6 @@ container policy separate from database and content-integrity checks.
 
 Manually adding Finder metadata or other files inside a `.kagextra` package
 makes it invalid until those files are removed. Package size limits and the
-durable synchronization checkpoint remain unresolved product decisions; this
-loader does not silently choose them.
+supported maximum package size remain unresolved product decisions; this
+loader does not silently choose them. ADR 0016 separately selects and
+implements the conservative synchronization checkpoint for publication.

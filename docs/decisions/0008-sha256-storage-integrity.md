@@ -18,8 +18,11 @@ Status: accepted for attachment and transfer integrity
 - Use the stable algorithm label `sha256` when the future manifest format needs
   an explicit algorithm field.
 
-This decision defines content integrity only. It does not decide attachment
-ownership, deduplication, deletion, allowed media types, encryption, manifest
+This decision defines content integrity only. Application-managed encryption
+at rest is separately required for live attachment objects, backups, and
+`.kagextra`; SHA-256 does not satisfy that requirement. This ADR does not
+select the encryption format or key-management design, nor does it decide
+attachment ownership, deduplication, deletion, allowed media types, manifest
 encoding, or the physical `.kagextra` container.
 
 ## Rationale
@@ -42,3 +45,8 @@ owner-only work file beside the destination, synchronizes and re-reads it,
 publishes with no overwrite, and treats later private cleanup failure as a
 warning. This local-filesystem primitive is not the undecided removable-drive
 `.kagextra` publication mechanism.
+
+File-backed description, verification, and copy reject non-regular or
+symlinked sources. On Unix, the implementation also compares device and inode
+identity around opening and after the complete read so a pathname substitution
+cannot redirect or detach the verified name from the object unnoticed.

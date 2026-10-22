@@ -1,6 +1,7 @@
 # Requirements
 
-Status: draft for review
+Status: confirmed Version 01 scope with remaining policy decisions recorded in
+`OPEN_QUESTIONS.md`
 
 ## Objective
 
@@ -18,13 +19,27 @@ The system uses IFRS concepts as accounting guidance but does not claim complete
 - Journal, general ledger, trial balance, balance sheet, and income/expense reporting.
 - Consistent backup and restore.
 - High-volume attachments stored and verified together with the book.
+- Application-managed encryption at rest for live attachment objects,
+  application-managed backups, and `.kagextra` transfer exports.
+- Do not create an application password, backup password, transfer password,
+  passphrase, PIN, or recovery phrase. Use operating-system key storage and
+  application-generated cryptographic keys instead.
 - Application-managed computer-to-computer transfer through a versioned
   `.kagextra` macOS directory package placed on user-selected removable
   storage.
 - Actionable error reporting.
 - Mac Safari desktop interface.
-- Responsive, touch-friendly iPad Safari interface.
 - Private remote access while the Mac is powered on and the user is logged in.
+
+## Delivery constraints
+
+- Complete non-UI accounting, storage, API, and runtime behavior before the
+  remaining UI work.
+- Implement the Mac Safari UI as the final Version 01 product phase.
+- Keep high-volume attachments in Version 01.
+- Time-box remaining Version 01 development according to
+  `DEVELOPMENT_PLAN.md`; scope changes require an explicit decision and revised
+  estimate.
 
 ## Required behavior
 
@@ -61,6 +76,8 @@ The system uses IFRS concepts as accounting guidance but does not claim complete
   location.
 - Export, copy, verify, and import `.kagextra` data through the application;
   do not depend on a manual Finder copy as the supported workflow.
+- Do not expose plaintext attachment, backup, or `.kagextra` payloads as
+  completed artifacts or leave plaintext intermediate files after failure.
 - Preserve the source book and every pre-existing valid destination when an
   export or import is interrupted, runs out of space, fails verification, or
   encounters an incompatible version.
@@ -74,6 +91,7 @@ The system uses IFRS concepts as accounting guidance but does not claim complete
 ## Out of scope for the first version
 
 - CSV export (deferred to Version 02).
+- Responsive, touch-friendly iPad Safari interface (deferred to Version 02).
 - iPhone-specific layout.
 - Docker, Linux/systemd, or cloud-server deployment.
 - Public internet exposure.
@@ -103,5 +121,10 @@ The detailed future specification and unresolved policy choices are recorded in 
 - Journal, ledger, and reports reconcile from the same posted data.
 - Backup, transfer, and restore reproduce a consistent database together with
   every referenced attachment and reject incomplete or damaged input.
-- The UI is usable with keyboard input on Mac and touch input on iPad.
+- The UI is usable with keyboard input in Mac Safari.
+
+## Version 02
+
+- Responsive, touch-friendly iPad Safari interface.
+- CSV export.
 

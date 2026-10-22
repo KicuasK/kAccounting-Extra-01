@@ -44,9 +44,12 @@ to make one fully prepared private package directory visible. ADR 0014 adds
 strict loading and read-only verification of the complete physical package.
 ADR 0015 adds private package assembly from an already verified staging tree.
 ADR 0016 adds conservative synchronization, atomic publication, and
-post-publication verification. Live-book snapshot orchestration, crash
-recovery, and removable-drive compatibility still require dedicated
-implementation and tests.
+post-publication verification. ADRs 0017–0019 compose those primitives into a
+verified export from one SQLite snapshot and an explicit attachment set; ADRs
+0020–0021 add durable export state and conservative restart classification.
+Live-book import replacement, automatic cleanup of ambiguous private work, and
+removable-drive compatibility still require dedicated decisions,
+implementation, and tests.
 
 Package registration and Finder presentation belong to the future macOS
 application packaging work. Browser and iPad transfer behavior must be designed
