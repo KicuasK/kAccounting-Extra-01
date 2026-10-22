@@ -1,0 +1,37 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Rust
+target/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Local runtime data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite-journal
+*.sqlite3-journal
+*.db
+*.db-*
+*.db3
+*.db3-*
+*.kagextra
+*.kagextra.partial
+.kAccounting-Extra-01-backup-*/
+.kAccounting-Extra-01-object-*/
+backups/
+
+# Editors
+.idea/
+.vscode/
+
