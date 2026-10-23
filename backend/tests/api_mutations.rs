@@ -564,3 +564,68 @@ async fn a_move_requires_an_explicit_parent_or_null_and_never_silently_moves_to_
     assert_eq!(status, StatusCode::OK);
     assert!(moved["parent_id"].is_null());
 }
+
+#[tokio::test]
+async fn optional_entry_time_is_strict_and_roundtrips_without_changing_accounting_date() {
+    let (pool, app, cash, equity) = setup().await;
+    for value in ["12:34", "24:00:00", "12:60:00", "12:34:60", "12:34:56Z", ""] {
+        let mut input = entry(&cash, &equity, "100");
+        input["entry_time"] = json!(value);
+        let (status, _) = send(&app, "POST", "/api/journal/drafts", input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    }
+    let mut input = entry(&cash, &equity, "100");
+    input["entry_time"] = json!("23:59:59");
+    let (status, draft) = send(&app, "POST", "/api/journal/drafts", input.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(draft["entry_time"], "23:59:59");
+    let path = format!("/api/journal/drafts/{}", draft["id"].as_str().unwrap());
+    input["entry_time"] = json!("00:00:00");
+    let (status, saved) = send(
+        &app,
+        "PUT",
+        &path,
+        json!({"expected_revision":"1", "entry":input}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["entry_time"], "00:00:00");
+    let (status, posted) = send(
+        &app,
+        "POST",
+        &format!("{path}/post"),
+        json!({"expected_revision":"2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(posted["entry_date"], "2026-10-22");
+    assert_eq!(posted["entry_time"], "00:00:00");
+    let posted_path = format!("/api/journal/posted/{}", posted["id"].as_str().unwrap());
+    let (status, reversed) = send(
+        &app,
+        "POST",
+        &format!("{posted_path}/reversal"),
+        json!({"entry_date":"2026-10-22", "entry_time":"12:34:56"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(reversed["entry_time"], "12:34:56");
+    let (status, corrected) = send(&app, "POST", &format!("{posted_path}/correction"), {
+        let mut v = entry(&cash, &equity, "50");
+        v["entry_time"] = json!("09:08:07");
+        v
+    })
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(corrected["entry_time"], "09:08:07");
+    let (status, omitted) = send(
+        &app,
+        "POST",
+        "/api/journal/drafts",
+        entry(&cash, &equity, "100"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(omitted["entry_time"].is_null());
+    verify_database_integrity(&pool).await.unwrap();
+}

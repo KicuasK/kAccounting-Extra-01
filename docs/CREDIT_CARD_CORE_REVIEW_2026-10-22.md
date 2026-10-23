@@ -1,5 +1,9 @@
 # Credit-card core/API review — pending policy, 2026-10-22
 
+2026-10-23 amendment: user removed account codes and selected explicit debit/credit
+balance direction for now. Card subtype, limits/capacity, prepayment, outstanding
+debt and the other policies below remain unapproved. No card formula was added.
+
 ## Scope and authority
 
 The UI conversation relayed the user's concern that credit-card logic may need

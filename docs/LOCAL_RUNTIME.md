@@ -1,7 +1,8 @@
 # Private local runtime
 
 The runtime is an integration preview, not a Version 01 release. The frontend
-still provides only the read-only account tree. The exact-money accounting
+provides explicit book selection and the account browser with verified as-of
+debit/credit balances, search, filters and summary. The exact-money accounting
 write API is available to same-origin requests; the journal editor and full
 Safari acceptance remain pending. Do not select a real financial book for
 development or acceptance tests.
@@ -25,7 +26,7 @@ existing book. Opening a book never creates a replacement key.
 ```sh
 mkdir -p -m 700 "$HOME/Library/Application Support/kAccounting-Extra-01"
 ./target/release/kaccounting-backend init-new "$HOME/Library/Application Support/kAccounting-Extra-01/book"
-./target/release/kaccounting-backend serve "$HOME/Library/Application Support/kAccounting-Extra-01/book" "$PWD/frontend/dist"
+./target/release/kaccounting-backend serve-chooser "$HOME/Library/Application Support/kAccounting-Extra-01" "$PWD/frontend/dist"
 ```
 
 Open `http://127.0.0.1:3000/` in Mac Safari. Use that exact address; `localhost`
@@ -52,9 +53,9 @@ The generator validates and prepares a **disabled plan**, never installs or
 starts it, modifies Tailscale, or contacts Keychain. Every start requires an
 explicit book choice. With `--assets`, the plan describes `serve-chooser`, which
 starts a loopback session with no selected book. Without assets it describes the
-key-free `books` discovery command. The frontend does not yet offer the selection
-controls, so this is readiness tooling rather than a complete graphical login
-workflow.
+key-free `books` discovery command. The frontend now offers selection controls.
+This remains readiness tooling until permanent installation and real login/reboot
+behavior are qualified.
 
 Select an existing user-owned mode-700 staging directory outside this repository
 and outside LaunchAgents/LaunchDaemons. The preparer does not create parents.

@@ -1033,6 +1033,7 @@ async fn every_success_response_has_the_complete_stable_json_schema() {
         &[
             "id",
             "entry_date",
+            "entry_time",
             "revision",
             "created_at",
             "lines",
@@ -1050,6 +1051,7 @@ async fn every_success_response_has_the_complete_stable_json_schema() {
         &[
             "id",
             "entry_date",
+            "entry_time",
             "revision",
             "created_at",
             "lines",
@@ -1067,6 +1069,7 @@ async fn every_success_response_has_the_complete_stable_json_schema() {
         &[
             "id",
             "entry_date",
+            "entry_time",
             "created_at",
             "posted_at",
             "lines",
@@ -1197,6 +1200,7 @@ async fn every_success_response_has_the_complete_stable_json_schema() {
                 "entry_id",
                 "line_id",
                 "entry_date",
+                "entry_time",
                 "line_no",
                 "side",
                 "amount_minor",
@@ -1247,6 +1251,7 @@ async fn every_success_response_has_the_complete_stable_json_schema() {
             &[
                 "id",
                 "entry_date",
+                "entry_time",
                 "posted_at",
                 "lines",
                 "debit_total_minor",

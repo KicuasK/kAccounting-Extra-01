@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import stat
@@ -18,6 +19,50 @@ MAX_ASSET = 32 * 1024 * 1024
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_FILES = 130
 TARGETS = {'macos-arm64': 0x0100000c, 'macos-x86_64': 0x01000007}
+APP_PREFIX = 'native/StoragePicker.app'
+APP_EXECUTABLE = APP_PREFIX + '/Contents/MacOS/StoragePicker'
+APP_INFO = APP_PREFIX + '/Contents/Info.plist'
+
+
+def startup_configuration(helper, native=True):
+    arguments = ['<PRIVATE_BOOK_COLLECTION>', '<BUNDLE>/frontend']
+    if helper and native:
+        arguments.append('<BUNDLE>/' + helper)
+    return {'command': 'serve-native-chooser' if helper and native else 'serve-chooser',
+            'arguments': arguments, 'requires_explicit_book_selection': True,
+            'existing_books_require_original_keychain_material': True, 'native_helper': helper}
+
+
+def helper_app_inputs(root, target):
+    root = canonical(root)
+    if root.suffix != '.app': raise Refused('Native application input must be a complete .app directory.')
+    expected_files = {'Contents/Info.plist', 'Contents/MacOS/StoragePicker'}
+    actual = set()
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        base = Path(directory); safe_directory(base)
+        for name in dirs:
+            if (base / name).relative_to(root).as_posix() not in {'Contents', 'Contents/MacOS'}:
+                raise Refused('Unexpected native application directory.')
+            safe_directory(base / name)
+        for name in files:
+            relative = (base / name).relative_to(root).as_posix()
+            if relative not in expected_files: raise Refused('Unexpected native application file.')
+            actual.add(relative)
+    if actual != expected_files: raise Refused('Incomplete native application.')
+    validate_helper_info(read_checked(root / 'Contents/Info.plist', 16384))
+    macho(root / 'Contents/MacOS/StoragePicker', MAX_HELPER, target)
+    return [(root / 'Contents/Info.plist', APP_INFO, 0o600), (root / 'Contents/MacOS/StoragePicker', APP_EXECUTABLE, 0o700)]
+
+
+def validate_helper_info(raw):
+    info = plistlib.loads(raw)
+    if (not isinstance(info, dict) or info.get('CFBundleExecutable') != 'StoragePicker'
+            or info.get('CFBundlePackageType') != 'APPL'
+            or not isinstance(info.get('CFBundleIdentifier'), str)
+            or not re.fullmatch(r'local\.kAccounting-Extra-01\.[A-Za-z0-9.-]{1,180}', info['CFBundleIdentifier'])
+            or info.get('NSPrincipalClass') != 'NSApplication'
+            or info.get('LSUIElement') is not False):
+        raise Refused('Native application identity or executable metadata is unsafe.')
 
 
 class Refused(ValueError):
@@ -135,16 +180,20 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def build(binary, frontend, output, target, revision, helper=None):
+def build(binary, frontend, output, target, revision, helper=None, helper_bundle=None):
     if target not in TARGETS or not re.fullmatch('[0-9a-f]{40}', revision):
         raise Refused('Target and exact source revision are required.')
     binary, frontend = canonical(binary), canonical(frontend)
     macho(binary, MAX_BINARY, target)
     inputs = [(binary, 'bin/kaccounting-backend', 0o700)] + frontend_inputs(frontend)
+    if helper and helper_bundle: raise Refused('Choose standalone helper or complete application, never both.')
     if helper:
         helper = canonical(helper)
         macho(helper, MAX_HELPER, target)
         inputs.append((helper, 'bin/StoragePicker', 0o700))
+    if helper_bundle:
+        inputs.extend(helper_app_inputs(helper_bundle, target))
+    if len(inputs) > MAX_FILES: raise Refused('Too many runtime files.')
     output = Path(output)
     if not output.is_absolute() or '..' in output.parts or not output.name:
         raise Refused('New output must be absolute.')
@@ -159,7 +208,7 @@ def build(binary, frontend, output, target, revision, helper=None):
     for source, relative, mode in sorted(inputs, key=lambda item: item[1]):
         if identity(parent.lstat())[:2] != identity(parent_identity)[:2] or identity(output.lstat())[:2] != identity(root_identity)[:2]:
             raise Refused('Output directory identity changed.')
-        maximum = MAX_BINARY if relative == 'bin/kaccounting-backend' else MAX_HELPER if relative == 'bin/StoragePicker' else MAX_ASSET
+        maximum = MAX_BINARY if relative == 'bin/kaccounting-backend' else MAX_HELPER if relative in {'bin/StoragePicker', APP_EXECUTABLE} else 16384 if relative == APP_INFO else MAX_ASSET
         data = read_checked(source, maximum)
         total += len(data)
         if total > MAX_TOTAL:
@@ -174,11 +223,7 @@ def build(binary, frontend, output, target, revision, helper=None):
         files[relative] = {'sha256': digest(data), 'bytes': len(data), 'mode': oct(mode)}
     manifest = {'format': FORMAT, 'project': 'kAccounting-Extra-01', 'kind': 'development-runtime',
                 'target': target, 'source_revision': revision, 'source_revision_role': 'declared-base-not-build-attestation', 'signing': 'unverified-development-build',
-                'files': files, 'startup': {'command': 'serve-chooser',
-                    'arguments': ['<PRIVATE_BOOK_COLLECTION>', '<BUNDLE>/frontend'],
-                    'requires_explicit_book_selection': True,
-                    'existing_books_require_original_keychain_material': True,
-                    'native_helper': 'bin/StoragePicker' if helper else None}}
+                'files': files, 'startup': startup_configuration(APP_EXECUTABLE if helper_bundle else 'bin/StoragePicker' if helper else None)}
     manifest_bytes = encoded(manifest)
     create_file(output / 'manifest.json', manifest_bytes, 0o600)
     expected = digest(manifest_bytes)
@@ -229,7 +274,7 @@ def verify(root, expected=None):
         safe_directory(base, True)
         for name in dirs:
             rel = (base / name).relative_to(root).as_posix()
-            if rel not in {'bin', 'frontend', 'frontend/assets'}: raise Refused('Unknown bundle directory.')
+            if rel not in {'bin', 'frontend', 'frontend/assets', 'native', APP_PREFIX, APP_PREFIX + '/Contents', APP_PREFIX + '/Contents/MacOS'}: raise Refused('Unknown bundle directory.')
             safe_directory(base / name, True)
         for name in names:
             rel = (base / name).relative_to(root).as_posix()
@@ -240,35 +285,44 @@ def verify(root, expected=None):
                 regular(p, 1024 * 1024)
                 if stat.S_IMODE(p.lstat().st_mode) != 0o600: raise Refused('Metadata mode changed.')
                 continue
-            mode = 0o700 if rel in {'bin/kaccounting-backend', 'bin/StoragePicker'} else 0o600
-            if mode == 0o600 and rel != 'frontend/index.html' and not re.fullmatch(r'frontend/assets/[A-Za-z0-9._-]+\.(?:js|css)', rel): raise Refused('Unsafe bundle member name.')
+            mode = 0o700 if rel in {'bin/kaccounting-backend', 'bin/StoragePicker', APP_EXECUTABLE} else 0o600
+            if mode == 0o600 and rel not in {'frontend/index.html', APP_INFO} and not re.fullmatch(r'frontend/assets/[A-Za-z0-9._-]+\.(?:js|css)', rel): raise Refused('Unsafe bundle member name.')
             info = files[rel]
             if (not isinstance(info, dict) or set(info) != {'sha256', 'bytes', 'mode'} or info['mode'] != oct(mode) or not isinstance(info['bytes'], int) or isinstance(info['bytes'], bool) or info['bytes'] <= 0 or not isinstance(info['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', info['sha256'])): raise Refused('Invalid member descriptor.')
-            maximum = MAX_BINARY if rel == 'bin/kaccounting-backend' else MAX_HELPER if rel == 'bin/StoragePicker' else 1024 * 1024 if rel == 'frontend/index.html' else MAX_ASSET
+            maximum = MAX_BINARY if rel == 'bin/kaccounting-backend' else MAX_HELPER if rel in {'bin/StoragePicker', APP_EXECUTABLE} else 16384 if rel == APP_INFO else 1024 * 1024 if rel == 'frontend/index.html' else MAX_ASSET
             regular(p, maximum)
             if stat.S_IMODE(p.lstat().st_mode) != mode: raise Refused('Member permissions changed.')
             data = read_checked(p, maximum)
             total += len(data)
             if len(data) != info['bytes'] or digest(data) != info['sha256'] or total > MAX_TOTAL: raise Refused('Member corruption or capacity exceeded.')
             if mode == 0o700: macho(p, maximum, manifest['target'])
+            if rel == APP_INFO: validate_helper_info(data)
     if actual != allowed: raise Refused('Missing bundle files.')
-    if manifest['startup'] != {'command': 'serve-chooser', 'arguments': ['<PRIVATE_BOOK_COLLECTION>', '<BUNDLE>/frontend'], 'requires_explicit_book_selection': True, 'existing_books_require_original_keychain_material': True, 'native_helper': 'bin/StoragePicker' if 'bin/StoragePicker' in files else None}: raise Refused('Unexpected startup metadata.')
-    return {'complete': True, 'manifest_sha256': digest(raw), 'file_count': len(files), 'target': manifest['target']}
+    app_members = {APP_INFO, APP_EXECUTABLE}.intersection(files)
+    if app_members and (app_members != {APP_INFO, APP_EXECUTABLE} or 'bin/StoragePicker' in files): raise Refused('Incomplete or conflicting native helper application.')
+    helper = APP_EXECUTABLE if APP_EXECUTABLE in files else 'bin/StoragePicker' if 'bin/StoragePicker' in files else None
+    native_startup = startup_configuration(helper)
+    legacy_startup = startup_configuration(helper, native=False)
+    if manifest['startup'] not in (native_startup, legacy_startup): raise Refused('Unexpected startup metadata.')
+    # Early v1 bundles declared a helper but started a safe chooser without
+    # native hooks. Retain integrity verification, explicitly report that gap.
+    legacy_native_startup = helper is not None and manifest['startup'] == legacy_startup
+    return {'complete': True, 'manifest_sha256': digest(raw), 'file_count': len(files), 'target': manifest['target'], 'native_helper': helper, 'legacy_native_startup': legacy_native_startup}
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--verify')
     p.add_argument('--expected-manifest-sha256')
-    p.add_argument('--binary'); p.add_argument('--frontend'); p.add_argument('--output'); p.add_argument('--native-helper')
+    p.add_argument('--binary'); p.add_argument('--frontend'); p.add_argument('--output'); p.add_argument('--native-helper'); p.add_argument('--native-helper-bundle')
     p.add_argument('--target', choices=sorted(TARGETS), default='macos-arm64'); p.add_argument('--revision')
     args = p.parse_args()
     if args.verify:
-        if any([args.binary, args.frontend, args.output, args.native_helper, args.revision]): p.error('Verify cannot include build inputs.')
+        if any([args.binary, args.frontend, args.output, args.native_helper, args.native_helper_bundle, args.revision]): p.error('Verify cannot include build inputs.')
         result = verify(args.verify, args.expected_manifest_sha256)
     else:
         if not all([args.binary, args.frontend, args.output, args.revision]) or args.expected_manifest_sha256: p.error('Build needs binary, frontend, NEW output and exact revision.')
-        result = build(args.binary, args.frontend, args.output, args.target, args.revision, args.native_helper)
+        result = build(args.binary, args.frontend, args.output, args.target, args.revision, args.native_helper, args.native_helper_bundle)
     print(json.dumps(result, sort_keys=True))
 
 

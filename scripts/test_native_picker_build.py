@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import plistlib
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -31,6 +32,7 @@ class NativeBuildTests(unittest.TestCase):
             module.build(str(self.output))
         self.assertEqual(self.output.read_bytes(), b'fake compiled executable')
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.output.stat().st_nlink, 1)
 
     def test_complete_app_bundle_is_atomically_published(self):
         output = self.parent / 'StoragePicker.app'
@@ -39,6 +41,27 @@ class NativeBuildTests(unittest.TestCase):
         executable = output / 'Contents/MacOS/StoragePicker'
         self.assertEqual(executable.read_bytes(), b'fake compiled executable')
         self.assertEqual(executable.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(executable.stat().st_nlink, 1)
+
+    def test_published_helpers_are_accepted_by_runtime_packager(self):
+        spec = importlib.util.spec_from_file_location('package_test', Path(__file__).with_name('package-macos-release.py'))
+        package = importlib.util.module_from_spec(spec); spec.loader.exec_module(package)
+        def fake_macho(arguments, check):
+            self.assertTrue(check)
+            Path(arguments[-1]).write_bytes(struct.pack('<II', 0xfeedfacf, package.TARGETS['macos-arm64']) + b'synthetic fixture')
+        for name in ['StoragePicker', 'StoragePicker.app']:
+            output = self.parent / name
+            with patch.object(module.subprocess, 'run', side_effect=fake_macho):
+                module.build(str(output))
+            executable = output / 'Contents/MacOS/StoragePicker' if output.suffix == '.app' else output
+            package.regular(executable, package.MAX_HELPER, True)
+            package.macho(executable, package.MAX_HELPER, 'macos-arm64')
+            self.assertEqual(executable.stat().st_nlink, 1)
+
+    def test_app_metadata_is_preserved(self):
+        output = self.parent / 'StoragePicker.app'
+        with patch.object(module.subprocess, 'run', side_effect=self.fake_compile):
+            module.build(str(output), 'local.kAccounting-Extra-01.NativeTest')
         with (output / 'Contents/Info.plist').open('rb') as file:
             info = plistlib.load(file)
         self.assertEqual(info['CFBundleIdentifier'], 'local.kAccounting-Extra-01.NativeTest')

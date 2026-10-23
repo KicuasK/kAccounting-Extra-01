@@ -21,20 +21,18 @@ The generic account schema is designed to remain valid while these questions are
 - When should a time deposit be current versus non-current in this personal reporting model?
 - What recognition rules apply to the two contract-related liability categories?
 
-## Four-digit account codes (new UI request)
+## Account codes — resolved by removal on 2026-10-23
 
-The later user request supersedes the earlier no-code display policy: four digits
-and account name in one column. The core has AccountId, not this code contract.
-Allocation/uniqueness, reuse, category/posting mapping, existing-account migration
-and capacity limits remain to be designed before implementation. Mockup codes and
-classifications are examples, not an approved default chart of accounts.
+The user replied 「科目代碼，可以刪除」. Visible codes, allocation and code
+migration are no longer required. Internal AccountId remains unchanged.
 
 ## Credit-card core/API review (pending user policy)
 
 See [credit-card assessment](CREDIT_CARD_CORE_REVIEW_2026-10-22.md). The current
 core has generic liability accounting but no card subtype/limit/derived-capacity
 contract. The UI concern that logic may change is not approval to copy legacy
-rules. Decide signed account-list balance presentation, separate available credit,
+rules. The user selected explicit debit/credit balance direction for now on
+2026-10-23; that interim display choice is resolved. Decide separate available credit,
 prepayment/over-limit behavior, reversals/backdating and effective-dated limit
 validation before implementation. Available credit must never replace a report
 account balance.

@@ -16,6 +16,42 @@ const APPLICATION_ID: i64 = 0x6B41_3031; // ASCII "kA01"
 const CLAIM_APPLICATION_ID_SQL: &str = "PRAGMA application_id = 1799434289";
 
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("table", "payment_memo_drafts"),
+    ("index", "payment_memo_drafts_memo_idx"),
+    ("trigger", "payment_memo_drafts_no_update"),
+    ("trigger", "payment_memo_drafts_no_delete"),
+    ("trigger", "payment_memo_drafts_validate_insert"),
+    ("trigger", "payment_memos_protect_linked"),
+    ("trigger", "journal_entries_payment_memo_posting"),
+    ("table", "open_item_batches"),
+    ("table", "open_items"),
+    ("table", "open_item_allocations"),
+    ("table", "open_item_allocation_voids"),
+    ("table", "open_item_events"),
+    ("index", "open_items_batch_idx"),
+    ("index", "open_item_allocations_item_idx"),
+    ("index", "open_item_allocations_line_idx"),
+    ("trigger", "open_item_batches_no_update"),
+    ("trigger", "open_item_batches_no_delete"),
+    ("trigger", "open_items_no_update"),
+    ("trigger", "open_items_no_delete"),
+    ("trigger", "open_item_allocations_no_update"),
+    ("trigger", "open_item_allocations_no_delete"),
+    ("trigger", "open_item_allocation_voids_no_update"),
+    ("trigger", "open_item_allocation_voids_no_delete"),
+    ("trigger", "open_item_events_no_update"),
+    ("trigger", "open_item_events_no_delete"),
+    ("trigger", "open_item_reversal_requires_unallocation"),
+    ("table", "payment_memos"),
+    ("table", "payment_memo_history"),
+    ("index", "payment_memos_due_idx"),
+    ("trigger", "payment_memos_initial"),
+    ("trigger", "payment_memos_revision"),
+    ("trigger", "payment_memos_no_delete"),
+    ("trigger", "payment_memos_audit_insert"),
+    ("trigger", "payment_memos_audit_update"),
+    ("trigger", "payment_memo_history_no_update"),
+    ("trigger", "payment_memo_history_no_delete"),
     ("table", "_sqlx_migrations"),
     ("table", "accounts"),
     ("index", "accounts_parent_id_idx"),
@@ -99,6 +135,7 @@ const REQUIRED_JOURNAL_ENTRY_COLUMNS: &[(&str, &str, i64, i64)] = &[
     ("corrects_entry_id", "INTEGER", 0, 0),
     ("explanation", "TEXT", 0, 0),
     ("reference", "TEXT", 0, 0),
+    ("entry_time", "TEXT", 0, 0),
 ];
 
 const REQUIRED_JOURNAL_LINE_COLUMNS: &[(&str, &str, i64, i64)] = &[
@@ -292,6 +329,10 @@ const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
         &[
             "id INTEGER PRIMARY KEY AUTOINCREMENT",
             "CHECK (id > 0)",
+            "length(entry_time) = 8",
+            "length(CAST(entry_time AS BLOB)) = 8",
+            "entry_time GLOB '[0-2][0-9]:[0-5][0-9]:[0-5][0-9]'",
+            "substr(entry_time, 1, 2) <= '23'",
             "entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'",
             "BETWEEN 1 AND 9999",
             "BETWEEN 1 AND 12",
@@ -388,7 +429,7 @@ const REQUIRED_SCHEMA_SQL_FRAGMENTS: &[(&str, &[&str])] = &[
     (
         "journal_entries_require_next_draft_revision",
         &[
-            "UPDATE OF entry_date, reference, explanation, revision",
+            "UPDATE OF entry_date, entry_time, reference, explanation, revision",
             "NEW.revision <> OLD.revision + 1",
             "draft journal entry revision must increase by one",
         ],
@@ -1169,12 +1210,32 @@ async fn verify_database_integrity_transaction(
 
     verify_journal_schema(transaction).await?;
     verify_attachment_schema(transaction).await?;
+    verify_payment_memo_schema(transaction).await?;
+    verify_open_item_schema(transaction).await?;
 
     for &(object_type, name) in REQUIRED_SCHEMA_OBJECTS {
         if !matches!(object_type, "index" | "trigger") {
             continue;
         }
-        let expected_owner = if name.starts_with("accounts_") {
+        let expected_owner = if name.starts_with("payment_memo_drafts_") {
+            "payment_memo_drafts"
+        } else if name == "open_item_reversal_requires_unallocation" {
+            "journal_entries"
+        } else if name.starts_with("open_item_allocation_voids_") {
+            "open_item_allocation_voids"
+        } else if name.starts_with("open_item_allocations_") {
+            "open_item_allocations"
+        } else if name.starts_with("open_item_batches_") {
+            "open_item_batches"
+        } else if name.starts_with("open_item_events_") {
+            "open_item_events"
+        } else if name.starts_with("open_items_") {
+            "open_items"
+        } else if name.starts_with("payment_memo_history_") {
+            "payment_memo_history"
+        } else if name.starts_with("payment_memos_") {
+            "payment_memos"
+        } else if name.starts_with("accounts_") {
             "accounts"
         } else if name.starts_with("journal_entries_") {
             "journal_entries"
@@ -1402,6 +1463,206 @@ async fn verify_database_integrity_transaction(
         )));
     }
 
+    Ok(())
+}
+
+async fn verify_open_item_schema(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), DatabaseError> {
+    static EXPECTED: tokio::sync::OnceCell<Vec<(String, String, String, String)>> =
+        tokio::sync::OnceCell::const_new();
+    let expected = EXPECTED.get_or_try_init(|| async {
+        let reference = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.map_err(DatabaseError::Connect)?;
+        let result = async {
+            // The reversal guard is attached to an existing journal table.
+            sqlx::raw_sql("CREATE TABLE journal_entries(id INTEGER,status TEXT,reverses_entry_id INTEGER); CREATE TABLE journal_lines(id INTEGER);").execute(&reference).await.map_err(DatabaseError::Query)?;
+            sqlx::raw_sql(include_str!("../migrations/0009_create_open_items.sql")).execute(&reference).await.map_err(DatabaseError::Query)?;
+            sqlx::query_as::<_,(String,String,String,String)>("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name GLOB 'open_item*' ORDER BY name").fetch_all(&reference).await.map_err(DatabaseError::Query)
+        }.await;
+        reference.close().await; result
+    }).await?;
+    for (kind, name, owner, sql) in expected {
+        let actual: Option<(String, String, String)> =
+            sqlx::query_as("SELECT type,tbl_name,sql FROM sqlite_schema WHERE name=?")
+                .bind(name)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(DatabaseError::Query)?;
+        if actual.as_ref() != Some(&(kind.clone(), owner.clone(), sql.clone())) {
+            return Err(DatabaseError::Integrity(format!(
+                "open item schema differs from migration 9: {name}"
+            )));
+        }
+    }
+    let invalid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM open_item_batches b JOIN journal_lines l ON l.id=b.source_line_id JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id WHERE e.status<>'posted' OR e.reverses_entry_id IS NOT NULL OR NOT ((b.kind='receivable' AND a.element='asset' AND l.side='debit') OR (b.kind='payable' AND a.element='liability' AND l.side='credit')) OR (SELECT COALESCE(SUM(i.amount_minor),0) FROM open_items i WHERE i.batch_id=b.id)<>l.amount_minor OR (SELECT COUNT(*) FROM open_item_events x WHERE x.kind='registered' AND x.entity_id=b.id)<>1)").fetch_one(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if invalid {
+        return Err(DatabaseError::Integrity(
+            "invalid open item source or audit".into(),
+        ));
+    }
+    let invalid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM open_item_allocations x JOIN open_items i ON i.id=x.item_id JOIN open_item_batches b ON b.id=i.batch_id JOIN journal_lines source ON source.id=b.source_line_id JOIN journal_entries se ON se.id=source.entry_id JOIN journal_lines payment ON payment.id=x.settlement_line_id JOIN journal_entries pe ON pe.id=payment.entry_id WHERE pe.status<>'posted' OR pe.reverses_entry_id IS NOT NULL OR source.account_id<>payment.account_id OR source.side=payment.side OR pe.entry_date<se.entry_date OR (SELECT COUNT(*) FROM open_item_events a WHERE a.kind='allocated' AND a.entity_id=x.id)<>1 OR (NOT EXISTS(SELECT 1 FROM open_item_allocation_voids v WHERE v.allocation_id=x.id) AND EXISTS(SELECT 1 FROM journal_entries r WHERE r.status='posted' AND r.reverses_entry_id IN (se.id,pe.id))))").fetch_one(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if invalid {
+        return Err(DatabaseError::Integrity(
+            "invalid open item allocation or audit".into(),
+        ));
+    }
+    let invalid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM open_items i WHERE (SELECT COALESCE(SUM(a.amount_minor),0) FROM open_item_allocations a WHERE a.item_id=i.id AND NOT EXISTS(SELECT 1 FROM open_item_allocation_voids v WHERE v.allocation_id=a.id))>i.amount_minor) OR EXISTS(SELECT 1 FROM journal_lines l WHERE (SELECT COALESCE(SUM(a.amount_minor),0) FROM open_item_allocations a WHERE a.settlement_line_id=l.id AND NOT EXISTS(SELECT 1 FROM open_item_allocation_voids v WHERE v.allocation_id=a.id))>l.amount_minor) OR EXISTS(SELECT 1 FROM open_item_allocation_voids v WHERE (SELECT COUNT(*) FROM open_item_events a WHERE a.kind='allocation_voided' AND a.entity_id=v.allocation_id)<>1)").fetch_one(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if invalid {
+        return Err(DatabaseError::Integrity(
+            "overallocated open item or missing cancellation audit".into(),
+        ));
+    }
+    let invalid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM open_item_events e WHERE (e.kind='registered' AND NOT EXISTS(SELECT 1 FROM open_item_batches b WHERE b.id=e.entity_id AND json_extract(e.details,'$.source_line_id')=CAST(b.source_line_id AS TEXT) AND json_extract(e.details,'$.kind')=b.kind)) OR (e.kind='allocated' AND NOT EXISTS(SELECT 1 FROM open_item_allocations a WHERE a.id=e.entity_id AND json_extract(e.details,'$.settlement_line_id')=CAST(a.settlement_line_id AS TEXT) AND json_extract(e.details,'$.item_id')=CAST(a.item_id AS TEXT) AND json_extract(e.details,'$.amount_minor')=CAST(a.amount_minor AS TEXT) AND json_extract(e.details,'$.kind')=a.kind)) OR (e.kind='allocation_voided' AND NOT EXISTS(SELECT 1 FROM open_item_allocation_voids v WHERE v.allocation_id=e.entity_id AND json_extract(e.details,'$.reason')=v.reason)))").fetch_one(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if invalid {
+        return Err(DatabaseError::Integrity(
+            "open item audit payload does not match its immutable record".into(),
+        ));
+    }
+    let dates: Vec<(Option<String>, String, Option<String>)> =
+        sqlx::query_as("SELECT due_date,description,counterparty FROM open_items")
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(DatabaseError::Query)?;
+    for (date, description, counterparty) in dates {
+        if date
+            .as_ref()
+            .is_some_and(|d| crate::accounting::journal::JournalDate::parse(d).is_err())
+            || description.trim() != description
+            || counterparty.as_ref().is_some_and(|c| c.trim() != c)
+        {
+            return Err(DatabaseError::Integrity(
+                "invalid open item metadata".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_payment_memo_schema(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), DatabaseError> {
+    type MemoIntegrityRow = (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        i64,
+    );
+    type MemoHistoryRow = (String, String, String, String, i64, String, String, i64);
+    static EXPECTED: tokio::sync::OnceCell<Vec<(String, String, String, String)>> =
+        tokio::sync::OnceCell::const_new();
+    let expected = EXPECTED.get_or_try_init(|| async {
+        let reference = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.map_err(DatabaseError::Connect)?;
+        let result = async {
+            sqlx::raw_sql(include_str!("../migrations/0008_create_payment_memos.sql")).execute(&reference).await.map_err(DatabaseError::Query)?;
+            // Trigger bodies can reference tables owned by other migrations.
+            sqlx::query("CREATE TABLE journal_entries(id INTEGER,status TEXT)").execute(&reference).await.map_err(DatabaseError::Query)?;
+            sqlx::raw_sql(include_str!("../migrations/0010_payment_memo_drafts.sql")).execute(&reference).await.map_err(DatabaseError::Query)?;
+            sqlx::query_as::<_,(String,String,String,String)>("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND name<>'journal_entries' ORDER BY name").fetch_all(&reference).await.map_err(DatabaseError::Query)
+        }.await;
+        reference.close().await;
+        result
+    }).await?;
+    for (kind, name, owner, sql) in expected {
+        let actual: Option<(String, String, String)> =
+            sqlx::query_as("SELECT type,tbl_name,sql FROM sqlite_schema WHERE name=?")
+                .bind(name)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(DatabaseError::Query)?;
+        if actual.as_ref() != Some(&(kind.clone(), owner.clone(), sql.clone())) {
+            return Err(DatabaseError::Integrity(format!(
+                "payment memo schema differs from migration 8: {name}"
+            )));
+        }
+    }
+    let rows:Vec<MemoIntegrityRow> = sqlx::query_as("SELECT id,due_date,title,payee,note,amount_minor,necessity,status,revision FROM payment_memos").fetch_all(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    for (id, date, title, payee, note, amount, necessity, status, revision) in rows {
+        if crate::accounting::journal::JournalDate::parse(&date).is_err()
+            || title.trim() != title
+            || title.is_empty()
+            || title.chars().count() > 200
+            || payee.trim() != payee
+            || payee.chars().count() > 200
+            || note.chars().count() > 2000
+            || title.chars().chain(payee.chars()).any(char::is_control)
+            || note
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            || amount <= 0
+            || !["required", "optional"].contains(&necessity.as_str())
+            || !["planned", "cancelled"].contains(&status.as_str())
+            || revision < 1
+        {
+            return Err(DatabaseError::Integrity(format!(
+                "invalid payment memo {id}"
+            )));
+        }
+        let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM payment_memo_history WHERE memo_id=? AND revision BETWEEN 1 AND ?").bind(id).bind(revision).fetch_one(&mut **transaction).await.map_err(DatabaseError::Query)?;
+        let matches:i64=sqlx::query_scalar("SELECT COUNT(*) FROM payment_memo_history h JOIN payment_memos m ON m.id=h.memo_id AND m.revision=h.revision WHERE m.id=? AND h.due_date=m.due_date AND h.title=m.title AND h.payee=m.payee AND h.note=m.note AND h.amount_minor=m.amount_minor AND h.necessity=m.necessity AND h.status=m.status AND h.recorded_at=m.updated_at").bind(id).fetch_one(&mut **transaction).await.map_err(DatabaseError::Query)?;
+        let maximum: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(revision) FROM payment_memo_history WHERE memo_id=?")
+                .bind(id)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(DatabaseError::Query)?;
+        if valid != revision || matches != 1 || maximum != Some(revision) {
+            return Err(DatabaseError::Integrity(format!(
+                "incomplete payment memo audit {id}"
+            )));
+        }
+    }
+    let history:Vec<MemoHistoryRow>=sqlx::query_as("SELECT due_date,title,payee,note,amount_minor,necessity,status,revision FROM payment_memo_history").fetch_all(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    for (date, title, payee, note, amount, necessity, status, revision) in history {
+        if crate::accounting::journal::JournalDate::parse(&date).is_err()
+            || title.trim() != title
+            || title.is_empty()
+            || title.chars().count() > 200
+            || payee.trim() != payee
+            || payee.chars().count() > 200
+            || note.trim() != note
+            || note.chars().count() > 2000
+            || title.chars().chain(payee.chars()).any(char::is_control)
+            || note
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            || amount <= 0
+            || !["required", "optional"].contains(&necessity.as_str())
+            || !["planned", "cancelled"].contains(&status.as_str())
+            || revision < 1
+        {
+            return Err(DatabaseError::Integrity(
+                "invalid payment memo audit snapshot".into(),
+            ));
+        }
+    }
+    let invalid_link:Option<i64>=sqlx::query_scalar("SELECT l.entry_id FROM payment_memo_drafts l JOIN journal_entries e ON e.id=l.entry_id WHERE e.status='posted' AND ((SELECT COUNT(*) FROM journal_lines WHERE entry_id=e.id)<>2 OR NOT EXISTS(SELECT 1 FROM journal_lines WHERE entry_id=e.id AND side='debit' AND account_id=l.debit_account_id AND amount_minor=l.amount_minor) OR NOT EXISTS(SELECT 1 FROM journal_lines WHERE entry_id=e.id AND side='credit' AND account_id=l.payment_asset_id AND amount_minor=l.amount_minor) OR NOT EXISTS(SELECT 1 FROM accounts WHERE id=l.payment_asset_id AND element='asset')) LIMIT 1").fetch_optional(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if invalid_link.is_some() {
+        return Err(DatabaseError::Integrity(
+            "posted payment memo linkage does not match journal".into(),
+        ));
+    }
+    let totals:Vec<(i64,i64,i64)>=sqlx::query_as("SELECT m.id,m.amount_minor,l.amount_minor FROM payment_memos m JOIN payment_memo_drafts l ON l.memo_id=m.id JOIN journal_entries e ON e.id=l.entry_id WHERE e.status='posted' AND NOT EXISTS(SELECT 1 FROM journal_entries r WHERE r.reverses_entry_id=e.id AND r.status='posted') ORDER BY m.id,l.entry_id").fetch_all(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    let mut paid = std::collections::HashMap::<i64, i64>::new();
+    for (id, total, amount) in totals {
+        let value = paid.entry(id).or_default();
+        *value = value
+            .checked_add(amount)
+            .ok_or_else(|| DatabaseError::Integrity("payment memo total overflow".into()))?;
+        if *value > total {
+            return Err(DatabaseError::Integrity("payment memo overpaid".into()));
+        }
+    }
+    let duplicate:Option<i64>=sqlx::query_scalar("SELECT l.memo_id FROM payment_memo_drafts l JOIN journal_entries e ON e.id=l.entry_id WHERE e.status='draft' GROUP BY l.memo_id HAVING COUNT(*)>1 LIMIT 1").fetch_optional(&mut **transaction).await.map_err(DatabaseError::Query)?;
+    if duplicate.is_some() {
+        return Err(DatabaseError::Integrity(
+            "multiple editable payment memo candidates".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2016,6 +2277,12 @@ mod tests {
         .await
         .expect("migrated draft should remain readable");
         assert_eq!(stored, ("2026-10-22".to_owned(), 1, 1));
+        let times: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT entry_time FROM journal_entries ORDER BY id")
+                .fetch_all(&migrated)
+                .await
+                .unwrap();
+        assert_eq!(times, vec![None, None]);
 
         let posted_state: (String, i64, Option<i64>, Option<i64>, Option<String>) =
             sqlx::query_as(

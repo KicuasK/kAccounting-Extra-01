@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Compile only into a private canonical parent; publish with exclusive link."""
+"""Compile only into a private canonical parent; publish with exclusive rename."""
 import os
 import ctypes
 import plistlib
@@ -70,7 +70,14 @@ def build(output_text, bundle_id='local.kAccounting-Extra-01.StoragePicker'):
             executable_parent.mkdir(parents=True, mode=0o700)
             for directory in [bundle, bundle / 'Contents', executable_parent]:
                 directory.chmod(0o700)
-            os.link(binary, executable_parent / 'StoragePicker', follow_symlinks=False)
+            stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            executable_fd = os.open(executable_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                exclusive_rename_at(stage_fd, binary.name, executable_fd, 'StoragePicker')
+            finally:
+                os.close(executable_fd)
+                os.close(stage_fd)
+            binary = executable_parent / 'StoragePicker'
             info = {
                 'CFBundleIdentifier': bundle_id, 'CFBundleExecutable': 'StoragePicker',
                 'CFBundleName': output.stem, 'CFBundleDisplayName': output.stem,
@@ -95,17 +102,16 @@ def build(output_text, bundle_id='local.kAccounting-Extra-01.StoragePicker'):
         if ((final_binary.st_dev, final_binary.st_ino) != (binary_metadata.st_dev, binary_metadata.st_ino)
                 or not stat.S_ISREG(final_binary.st_mode) or final_binary.st_uid != os.getuid()
                 or stat.S_IMODE(final_binary.st_mode) != 0o700
-                or final_binary.st_nlink != (2 if bundle is not None else 1)):
+                or final_binary.st_nlink != 1):
             raise ValueError('Compiler output changed before publication; private stage retained.')
-        # link() creates the final name exclusively: no check-then-overwrite race.
-        if bundle is None:
-            os.link(binary, output.name, dst_dir_fd=parent_fd, follow_symlinks=False)
-        else:
-            stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                exclusive_rename_at(stage_fd, bundle.name, parent_fd, output.name)
-            finally:
-                os.close(stage_fd)
+        # No replace publication and no writable staging hardlink to the final
+        # executable. The runtime bundler requires single-link inputs.
+        stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            exclusive_rename_at(stage_fd, bundle.name if bundle is not None else binary.name, parent_fd, output.name)
+            os.fsync(stage_fd)
+        finally:
+            os.close(stage_fd)
         os.fsync(parent_fd)
         print('Compiled native helper; no panel opened: ' + str(output))
         if bundle is not None:

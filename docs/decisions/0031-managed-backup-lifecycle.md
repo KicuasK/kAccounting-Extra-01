@@ -9,6 +9,25 @@ new checkpoint. Reading those ordering receipts does not rehash old attachment
 payloads; retention still verifies each complete candidate before deletion.
 Real Keychain and representative large-book acceptance remain release gates.
 
+2026-10-23 selected-session integration: restored/imported old-format books may
+explicitly initialize their missing namespace through `POST /api/backups/identity {}`.
+The UI offers this separate checkbox-confirmed action only after a manual backup
+reports `backup_identity_missing`. Opening, restore and ordinary backup never
+initialize it implicitly. Setup returns exact `201 {initialized:true}` and does
+not start a backup, switch books or replace a device key.
+
+`GET /api/backups/identity` returns exact `{initialized:boolean}` for explicit
+unknown-outcome reconciliation. It authenticates existing metadata with the cached
+process key; false means genuinely absent metadata and an empty identity cache.
+Corrupt/replaced/inconsistent metadata fails with `backup_identity_invalid`.
+Existing identity is create-only (`backup_identity_exists`), maintenance admission
+is non-queued (`backup_busy`), and other failure preserves uncertain data.
+Both routes enforce the selected session generation. An owned worker keeps that
+book's lease across publication even if the HTTP caller disconnects; the same
+runtime's shared, single-assignment identity cache is populated only after success.
+Manual backup then works in that same session after a separate explicit action.
+These checks do not grant authority to prune any previous namespace.
+
 ## Decision
 
 A local device key does not identify an accounting book. Generate a random

@@ -1,5 +1,7 @@
 # Backend API
 
+AR/AP posted-line tracking endpoints are documented in [AR/AP API](ARAP_API_2026-10-23.md).
+
 Status: private loopback integration preview with explicit accounting and
 book-command write APIs. Version 01 and Tailscale deployment remain incomplete.
 
@@ -23,6 +25,82 @@ JSON `null`. The current response models emit no JSON number values.
 Dates are strings containing validated, existing `YYYY-MM-DD` calendar dates.
 UTC database timestamps are returned as stored strings. Enum values use the
 lowercase database vocabulary documented in `DATABASE_SCHEMA.md`.
+
+## Payment memos and explicit payment candidates (2026-10-23)
+
+Payment memos are non-posting plans, not ledger balances or payable recognition.
+All routes are scoped to the selected book; session serving applies the existing
+selection-generation guard. Write routes additionally require the exact trusted
+Origin. The default read-only router exposes only the collection GET.
+
+| Route | Request | Success |
+| --- | --- | --- |
+| `GET /api/payment-memos?from=YYYY-MM-DD&through=YYYY-MM-DD` | Both inclusive date bounds required; unknown query fields rejected | `200 {items: Memo[], required_total_minor: string}` |
+| `POST /api/payment-memos` | `MemoFields` | `201 Memo` |
+| `PUT /api/payment-memos/{id}` | `MemoFields` plus `expected_revision` | `200 Memo` |
+| `POST /api/payment-memos/{id}/cancel` | `{expected_revision: string}` | `200 Memo` |
+| `POST /api/payment-memos/{id}/reopen` | `{expected_revision: string}` | `200 Memo` |
+| `POST /api/payment-memos/{id}/draft` | Payment candidate fields below | `201 {entry_id, entry_revision, memo_id, amount_minor}`; all values strings |
+
+`MemoFields` has exactly six required properties:
+
+```json
+{"due_date":"2026-10-23","title":"Water payment","payee":"Supplier","note":"","amount_minor":"1200","necessity":"required"}
+```
+
+`title`, `payee`, and `note` are trimmed. Title must contain 1–200 characters;
+payee allows 0–200 and note 0–2000. Title/payee reject control characters; note
+permits only newline and tab among control characters. Amount is a positive
+canonical decimal integer string within SQLite i64. Necessity is `required` or
+`optional`. Unknown JSON fields, JSON numbers, padded integer strings, nonexistent
+dates and reversed ranges are rejected. IDs and positive revisions also use
+canonical decimal strings.
+
+`Memo` contains `id`, `revision`, the six fields, `status`, `created_at`,
+`updated_at`, `paid_amount_minor`, `remaining_minor`, and `payment_draft_id`.
+Status is `planned` or `cancelled`; it is never writable as `paid`.
+`payment_draft_id` is a string or null. Collection rows include cancelled plans,
+ordered by due date and ID. `required_total_minor` sums remaining amounts of
+planned, required memos within the explicit date range, with checked overflow.
+It is a planning subtotal, not cash availability or an accounting liability.
+
+Updates require the exact current revision and a planned memo. Cancel applies
+only to planned memos; reopen applies only to cancelled memos. Successful changes
+increment revision and append an immutable full snapshot. An active payment draft
+or effective posted payment prevents editing/cancelling the plan. Delete the
+editable candidate, or explicitly reverse posted payment and review, before
+changing that plan. No memo deletion or manual paid endpoint exists.
+
+Payment candidate request:
+
+```json
+{"expected_revision":"1","entry_date":"2026-10-23","debit_account_id":"12","payment_asset_id":"18","amount_minor":"1200"}
+```
+
+The caller explicitly chooses the date, distinct active posting-leaf accounts,
+and positive amount no greater than remaining. The credit/payment account must
+be an asset; no debit account is guessed from memo text. Admission takes the
+SQLite writer lock, creates one balanced two-line draft and its immutable memo
+link in one transaction. At most one editable candidate exists per memo. The
+returned entry starts at revision `"1"`; creating it neither posts nor pays.
+
+Posting uses the existing journal API. A database posting trigger verifies that
+the two lines still exactly match the recorded amount/accounts, the memo remains
+at its admitted revision and planned state, and cumulative effective payments
+cannot exceed the plan. All posting entrances enforce this atomically. Amount
+changes in the general journal require deleting this candidate and creating a
+new explicit one. Posting a matching candidate makes its link count as payment;
+reversing that posted entry removes its effective amount from the derived total
+while preserving both journal and link history. Partial amounts are supported by
+the API, and the remaining amount can produce a subsequent candidate. Plans are
+not automatically matched to unrelated AP items or journal entries.
+
+Domain errors: `400 payment_memo_invalid`, `404 payment_memo_not_found`,
+`409 payment_memo_conflict`, and `422 payment_memo_overflow`. A changed payment
+candidate rejected during posting also returns `409 payment_memo_conflict`.
+Existing boundary/body-size/authentication errors still apply. No automatic
+retry or idempotency key is provided: after an unknown write outcome, refresh
+and reconcile before explicitly submitting again.
 
 ## Read-only routes
 
@@ -50,8 +128,8 @@ current field sets:
 - Account: `{id, parent_id, name, element, kind, is_active, revision,
   created_at, updated_at}`. Account list and path responses are arrays of this
   object; a tree node is `{account, children}` recursively.
-- Draft: `{id, entry_date, revision, created_at, reference, explanation, lines}`.
-  Posted entry: `{id, entry_date, created_at, posted_at, reference, explanation,
+- Draft: `{id, entry_date, entry_time, revision, created_at, reference, explanation, lines}`.
+  Posted entry: `{id, entry_date, entry_time, created_at, posted_at, reference, explanation,
   relationship, original_entry_id, lines}`. Relationship is `ordinary`,
   `reversal`, or `correction`; the original ID is nullable. Their line shape is
   `{id, line_no, account_id, side, amount_minor, memo}`.
@@ -64,10 +142,10 @@ current field sets:
   opening_debit_balance_minor, opening_credit_balance_minor, lines,
   period_debit_turnover_minor, period_credit_turnover_minor,
   closing_debit_balance_minor, closing_credit_balance_minor}`. Each line is
-  `{entry_id, line_id, entry_date, line_no, side, amount_minor,
+  `{entry_id, line_id, entry_date, entry_time, line_no, side, amount_minor,
   debit_balance_minor, credit_balance_minor, reference, explanation, memo}`.
 - General journal: `{from, through, entries, total_debit_minor,
-  total_credit_minor}`. Each entry is `{id, entry_date, posted_at, lines,
+  total_credit_minor}`. Each entry is `{id, entry_date, entry_time, posted_at, lines,
   debit_total_minor, credit_total_minor, reference, explanation}`; each line is
   `{id, line_no, account_id, account_name, side, amount_minor, memo}`.
 - Income/expense: `{from, through, rows, total_income_minor,
@@ -168,7 +246,7 @@ string integers, strict known fields, and a 1 MiB body limit.
 | `DELETE /api/journal/drafts/{id}` | `{expected_revision}` | 204 |
 | `POST /api/journal/drafts/{id}/post` | `{expected_revision}` | 200 Posted |
 | `POST /api/journal/posted` | Entry document | 201 Posted |
-| `POST /api/journal/posted/{id}/reversal` | `{entry_date}` | 201 Posted |
+| `POST /api/journal/posted/{id}/reversal` | `{entry_date, entry_time?}` | 201 Posted |
 | `POST /api/journal/posted/{id}/correction` | Entry document with nonblank explanation | 201 Posted |
 
 Account changes use `operation` plus `expected_revision` and the indicated
@@ -181,6 +259,7 @@ Entry example:
 ```json
 {
   "entry_date": "2026-10-22",
+  "entry_time": "09:30:15",
   "reference": "Opening 001",
   "explanation": "Opening entry",
   "lines": [
@@ -189,6 +268,15 @@ Entry example:
   ]
 }
 ```
+
+`entry_time` is optional local civil time, accepted as `HH:mm:ss` (00:00:00–23:59:59)
+or null; omitted values remain compatible with date-only clients and legacy
+entries. Empty strings, fractional seconds and timezone suffixes are rejected.
+It is independent of `created_at`/`posted_at`, does not shift the accounting date,
+and does not change date-based report filters or date/ID ordering. Draft create,
+replacement, posting and correction preserve it; reversal may explicitly supply
+its own optional time, otherwise null. Replacing a draft without it clears it.
+Time changes follow the same draft revision and posted-entry immutability rules.
 
 Optional reference, explanation, and memo fields accept null. A complete draft
 replacement clears omitted optional metadata. Drafts may be incomplete or
@@ -236,6 +324,38 @@ identity returns 409 `backup_identity_missing`; HTTP does not silently initializ
 or repair it. A busy maintenance lock returns 409 `backup_busy`. Unrecognized
 backup content and symbolic links are preserved.
 
+### Explicit backup-identity setup in selected sessions
+
+The session runtime adds the following routes. Both require an explicitly selected
+book, a mandatory matching `X-kAccounting-Selection` generation, and the existing
+Host/Origin/Fetch Metadata boundary. Requests cannot select paths, namespaces or keys.
+
+| Method and path | Input | Result |
+| --- | --- | --- |
+| `GET /api/backups/identity` | No body | `200 {initialized: boolean}` |
+| `POST /api/backups/identity` | Exact empty JSON object `{}` | `201 {initialized: true}` |
+
+Initialization is a separate explicit action, not a side effect of opening,
+restoring or attempting a backup. It creates a fresh authenticated namespace
+without replacing an existing identity or changing the device key. The selected
+runtime's shared identity cache is updated only after publication succeeds; a
+subsequent explicit manual backup in the same selected session can use it.
+No backup or selection change is triggered automatically.
+
+`GET` authenticates an existing identity using the process-held key. Only a truly
+missing identity with no cached identity returns `initialized:false`; corrupted,
+replaced or inconsistent identity returns `409 backup_identity_invalid`, not false.
+`POST` refuses existing identity with `409 backup_identity_exists` and active
+maintenance with `409 backup_busy`. Other setup failure is reported as
+`backup_identity_initialization_failed`; preserve uncertain files and use the status
+read to reconcile before another explicit action. Generation mismatch returns
+`409 selection_changed` before setup. Neither route returns identity/key IDs or paths.
+
+The owned initialization worker retains the selected-book lease through completion,
+including requester disconnection. It cannot publish against a replacement selection.
+Unknown response outcomes must not be blindly retried; the UI explicitly reads
+status and retains its block when authentication or response validation fails.
+
 Backup success is `{backup_name, verified: true, attachment_count,
 attachment_bytes, retention_warning, preserved_unrecognized}`. Counts and sizes
 are decimal strings. `backup_name` identifies a managed directory below the
@@ -251,6 +371,14 @@ See [attachment streaming](ATTACHMENT_STREAMING.md) for required metadata,
 draft revisions, posted append, limits, cancellation and error behavior. These
 routes use bounded crypto bridges, not whole-file plaintext buffers or files.
 
+Attachment IDs are random **32-character lowercase hexadecimal strings**, not
+SQLite integer identifiers. The browser attachment UI lists metadata, explicitly
+confirms original-`File` streaming upload, verifies integrity, and offers detach
+only for saved drafts. Draft upload/detach refresh the draft revision before
+later writes. Posted append creates a new immutable attachment reference; it
+never replaces an existing one. Unconfirmed write outcomes preserve the selected
+file and require explicit list/revision reconciliation before another mutation.
+
 ## Explicit book sessions and storage transfer (Round 2)
 
 `serve-chooser <private-book-collection> <frontend-dist>` starts a session without
@@ -260,20 +388,34 @@ and unknown paths. Session control JSON is limited to 4096 bytes.
 
 | Method and path | Input / behavior |
 | --- | --- |
-| `GET /api/session` | `{book_id, selection_required}`; no paths or key IDs |
+| `GET /api/session` | `{book_id, selection_required, selection_id}`; no paths or key IDs |
 | `GET /api/session/books` | Available direct-child book IDs; discovery does not read keys |
 | `POST /api/session/selection` | `{book_id}`; exact listed direct-child ID only |
 | `DELETE /api/session/selection` | Explicitly clear the current selection |
 
 Accounting/storage access requires explicit selection even with one candidate.
+`selection_id` (2026-10-23) is null without selection, otherwise an opaque
+32-character lowercase hexadecimal generation. Returning to the same book after
+a switch creates a fresh generation; selecting the already active book preserves
+it. This is concurrency metadata, not an authentication credential.
+
+New browser data requests and select/close actions send
+`X-kAccounting-Selection: <selection_id>` (or `unselected` for an empty session).
+The guard is checked under the dispatch/transition lease before accounting
+dispatch, key reads or selection changes. Mismatch returns 409 `selection_changed`;
+malformed/duplicate guards return 400 `invalid_selection_guard`. Earlier integration
+clients may omit it for compatibility; all new browser financial controls must
+supply it. Existing Host/Origin/identity checks still apply.
+
 Active response bodies and owned storage jobs prevent selection changes (409
 `book_busy`); a failed replacement preserves the current book. Shutdown drains
 responses/jobs before closing its book. Import/restore never switch the session.
 
 Storage JSON accepts typed random process-local capabilities registered by a
 trusted local adapter after genuine selection, never paths, keys or overwrite
-instructions. There is deliberately no HTTP capability-registration endpoint.
-The picker/interface is still pending. Capabilities bind existing ancestor
+instructions. There is deliberately no arbitrary HTTP capability-registration
+endpoint. The explicit loopback browser-native action below invokes a genuine
+panel; private ingress excludes it. Capabilities bind existing ancestor
 identities; destination capabilities are consumed on admission. Public recipient
 request content is captured at selection and must be confirmed before export.
 
@@ -315,3 +457,51 @@ See [storage capability contract](decisions/0043-storage-http-selection-capabili
 [container import](decisions/0050-container-import-pipeline.md),
 [local runtime](LOCAL_RUNTIME.md), and
 [round-two audit](RELEASE_AUDIT_R2_2026-10-22.md).
+
+## Explicit loopback browser native actions
+
+`NativeHost.browser_router()` adds `POST /api/native/selections` only to the
+local browser composition. Its strict JSON body is `{kind}`, limited to 4096
+bytes. Accepted kinds are `book`, `request`, `package`, `backup`,
+`request-destination`, `export-destination`, `book-destination`, and
+`recovery-parent`. No path, helper, owner UID, key, arbitrary capability ID, or
+overwrite instruction is accepted from the browser.
+
+Existing exact loopback Host/Origin and fetch-site restrictions apply. This
+native action additionally requires a canonical `X-kAccounting-Selection`
+header and an explicitly selected matching book. The native action guard holds
+the generation lease through panel admission and capability registration.
+Success is `{capability_id: "<32 lowercase hex>"}`; cancellation returns
+`{capability_id: null}` without admitting a storage job. Only one panel is
+admitted at a time. Startup supplies the trusted pinned helper; a genuine user
+panel selection determines the capability.
+
+The private Unix/HTTPS ingress uses `NativeHost.router()` and excludes this
+panel endpoint. Native-panel availability is not evidence that permanent private
+deployment, Keychain authorization, or login/reboot acceptance has passed.
+
+## Native download generation guard
+
+New browser-native downloads use exactly one query field
+`download_selection=<32 lowercase hex selection generation>` on only:
+
+- `GET /api/attachments/{32-lowercase-hex-attachment-id}/content`
+- `GET /api/storage/operations/{32-lowercase-hex-operation-id}/download`
+
+This narrow query alternative allows Safari's native download action, which
+cannot add a custom header. It is checked under the same selected-book read
+lease as dispatch; the leased streaming body continues to prevent switching
+until it is consumed or dropped. A stale generation returns 409
+`selection_changed` before financial dispatch. Malformed/duplicate/extra query
+fields, an unsupported route/method, and a conflicting selection header return
+400 `invalid_selection_guard`. Existing origin/fetch-site/identity protections
+remain; the generation is concurrency metadata, not authentication.
+
+The ordinary header route remains available to direct streaming clients. New
+browser download links always carry the query guard and use same-origin exact
+binary routes; uploads pass the original `File` directly with the header guard.
+The UI never buffers an entire download as a Blob and reports only handoff to
+Safari. Completion must be checked in Safari's download list/Downloads.
+
+See [browser native actions ADR](decisions/0053-browser-native-actions.md) and
+[storage UI acceptance checklist](STORAGE_UI_ACCEPTANCE_2026-10-23.md).

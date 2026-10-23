@@ -330,7 +330,10 @@ use crate::{
 };
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 use zeroize::Zeroizing;
 
 #[derive(Clone)]
@@ -338,7 +341,7 @@ struct BackupState {
     pool: sqlx::SqlitePool,
     attachment_root: PathBuf,
     backup_root: PathBuf,
-    book_id: Option<BookBackupId>,
+    book_id: Arc<OnceLock<BookBackupId>>,
     keys: CachedKey,
 }
 /// Read-only process-held key material; HTTP never generates or stores keys.
@@ -365,7 +368,7 @@ pub(super) fn backup_routes(book: &RuntimeBook) -> Router {
             pool: book.pool().clone(),
             attachment_root: book.attachments(),
             backup_root: book.root().join("backups"),
-            book_id: book.backup_id().cloned(),
+            book_id: book.backup_identity_cell(),
             keys: CachedKey {
                 id: book.key_id().clone(),
                 key: book.key(),
@@ -396,7 +399,7 @@ async fn create_backup(
             message: "Send an empty JSON object to create a local backup.".to_owned(),
         },
     })?;
-    let book_id=state.book_id.as_ref().ok_or(ApiError::Conflict{code:"backup_identity_missing",message:"This book requires an explicit backup identity setup before managed backups can be created.".to_owned()})?;
+    let book_id=state.book_id.get().ok_or(ApiError::Conflict{code:"backup_identity_missing",message:"This book requires an explicit backup identity setup before managed backups can be created.".to_owned()})?;
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);

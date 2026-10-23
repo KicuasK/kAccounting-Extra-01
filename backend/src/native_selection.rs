@@ -78,6 +78,8 @@ struct Request {
     format: &'static str,
     nonce: String,
     kind: PickerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_directory: Option<PathBuf>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,17 +178,28 @@ impl NativePicker {
             .clone()
             .try_acquire_owned()
             .map_err(|_| NativeSelectionError::Busy)?;
-        self.choose_cancellable(kind, Arc::new(AtomicBool::new(false)), permit)
+        self.choose_cancellable(kind, Arc::new(AtomicBool::new(false)), permit, None)
     }
     fn choose_cancellable(
         &self,
         kind: SelectionKind,
         cancelled: Arc<AtomicBool>,
         _permit: tokio::sync::OwnedSemaphorePermit,
+        initial_directory: Option<PathBuf>,
     ) -> Result<Option<PathBuf>, NativeSelectionError> {
         self.validate()?;
         if cancelled.load(Ordering::Acquire) {
             return Err(NativeSelectionError::Worker);
+        }
+        if let Some(directory) = initial_directory.as_ref()
+            && (kind != SelectionKind::BookDestination
+                || !directory.is_absolute()
+                || directory.as_os_str().as_encoded_bytes().len() > 4096
+                || directory.canonicalize()? != *directory
+                || !fs::symlink_metadata(directory)?.is_dir()
+                || directory.to_string_lossy().chars().any(char::is_control))
+        {
+            return Err(NativeSelectionError::InvalidResponse);
         }
         let mut random = [0; 32];
         getrandom::fill(&mut random).map_err(|_| NativeSelectionError::Worker)?;
@@ -194,8 +207,12 @@ impl NativePicker {
             format: FORMAT,
             nonce: random.iter().map(|b| format!("{b:02x}")).collect(),
             kind: kind.into(),
+            initial_directory,
         };
         let encoded = serde_json::to_vec(&request).map_err(|_| NativeSelectionError::Worker)?;
+        if encoded.len() > 16384 {
+            return Err(NativeSelectionError::InvalidResponse);
+        }
         let mut child = Command::new(&self.executable)
             .env_clear()
             .current_dir(&self.parent)
@@ -275,6 +292,47 @@ impl NativePicker {
     ) -> Result<Option<String>, NativeSelectionError> {
         self.select_and_register_inner(session, kind, None).await
     }
+    pub(crate) async fn select_and_register_guarded(
+        &self,
+        guard: &crate::session_runtime::NativeActionGuard,
+        kind: SelectionKind,
+    ) -> Result<Option<String>, NativeSelectionError> {
+        self.choose_native_path(kind, None)
+            .await?
+            .map(|path| {
+                guard
+                    .register(kind, path)
+                    .map_err(NativeSelectionError::from)
+            })
+            .transpose()
+    }
+    pub(crate) async fn choose_book_destination(
+        &self,
+        collection: &Path,
+    ) -> Result<Option<PathBuf>, NativeSelectionError> {
+        self.choose_native_path(SelectionKind::BookDestination, Some(collection.to_owned()))
+            .await
+    }
+    async fn choose_native_path(
+        &self,
+        kind: SelectionKind,
+        initial_directory: Option<PathBuf>,
+    ) -> Result<Option<PathBuf>, NativeSelectionError> {
+        let permit = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| NativeSelectionError::Busy)?;
+        let picker = self.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+        let selected = tokio::task::spawn_blocking(move || {
+            picker.choose_cancellable(kind, cancelled, permit, initial_directory)
+        })
+        .await
+        .map_err(|_| NativeSelectionError::Worker)??;
+        Ok(selected)
+    }
     /// Native acceptance/host restriction: only this exact expected path may be
     /// registered. The expected path is trusted local configuration, not HTTP.
     pub async fn select_and_register_exact(
@@ -301,10 +359,11 @@ impl NativePicker {
         let picker = self.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-        let selected =
-            tokio::task::spawn_blocking(move || picker.choose_cancellable(kind, cancelled, permit))
-                .await
-                .map_err(|_| NativeSelectionError::Worker)??;
+        let selected = tokio::task::spawn_blocking(move || {
+            picker.choose_cancellable(kind, cancelled, permit, None)
+        })
+        .await
+        .map_err(|_| NativeSelectionError::Worker)??;
         match selected {
             None => Ok(None),
             Some(path) => {
@@ -531,6 +590,7 @@ mod tests {
                 SelectionKind::Request,
                 worker_cancel,
                 permit,
+                None,
             ));
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

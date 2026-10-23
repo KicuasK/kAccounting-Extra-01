@@ -44,6 +44,14 @@ imports retain their stricter mode, symlink, and identity checks.
 
 `GET /api/attachments/{attachment_id}/content`
 
+`attachment_id` is 32 lowercase hexadecimal characters. For Safari native
+download, append the single query field `download_selection=<selection_id>`;
+the chooser checks it under the same selected-book dispatch/body lease. Only
+this binary GET and completed export download accept that query alternative.
+Direct streaming clients may continue to use `X-kAccounting-Selection`.
+Malformed/extra/duplicate query fields and conflicting header/query generations
+are rejected. See [browser native actions ADR](decisions/0053-browser-native-actions.md).
+
 The complete stored ciphertext digest and plaintext digest/authentication are
 checked before a successful response is created. A second authenticated decrypt
 pass streams from the same opened encrypted file handle. Responses use
@@ -87,3 +95,10 @@ without collecting a plaintext file or whole-body buffer:
 Tests use disposable temporary books and fake in-memory keys, never a real
 accounting book or the user's Keychain. Actual socket/runtime acceptance and Mac
 Safari interaction acceptance remain separate integration checks.
+
+The browser UI sends an explicitly selected original `File` directly, without
+whole-file materialization. Draft upload/detach refresh the draft revision;
+unknown outcomes require list/revision reconciliation before another mutation.
+Posted entries allow explicit append only. Downloads are handed to Safari's
+native pipeline and the UI does not claim that a completed file already exists
+in Downloads; the user checks Safari completion separately.

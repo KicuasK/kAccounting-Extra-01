@@ -76,6 +76,32 @@ impl JournalDate {
     }
 }
 
+/// Optional local civil time metadata; never changes the accounting date or implies a timezone.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct JournalTime(String);
+impl JournalTime {
+    pub fn parse(value: &str) -> Result<Self, JournalError> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 8
+            || bytes[2] != b':'
+            || bytes[5] != b':'
+            || bytes
+                .iter()
+                .enumerate()
+                .any(|(i, b)| i != 2 && i != 5 && !b.is_ascii_digit())
+            || parse_date_part(&bytes[0..2]) > 23
+            || parse_date_part(&bytes[3..5]) > 59
+            || parse_date_part(&bytes[6..8]) > 59
+        {
+            return Err(JournalError::InvalidTime(value.to_owned()));
+        }
+        Ok(Self(value.to_owned()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Which side of the general journal receives a line amount.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JournalSide {
@@ -145,6 +171,7 @@ pub enum JournalValidationError {
 /// Posting request with the approved optional journal header fields.
 pub struct PostEntry {
     pub entry_date: JournalDate,
+    pub entry_time: Option<JournalTime>,
     pub lines: Vec<JournalLineInput>,
     pub reference: Option<String>,
     pub explanation: Option<String>,
@@ -184,6 +211,7 @@ impl PostCorrection {
 /// A user-editable draft. Draft lines may be incomplete or unbalanced.
 pub struct SaveDraftEntry {
     pub entry_date: JournalDate,
+    pub entry_time: Option<JournalTime>,
     pub lines: Vec<JournalLineInput>,
     pub reference: Option<String>,
     pub explanation: Option<String>,
@@ -193,10 +221,16 @@ impl SaveDraftEntry {
     pub fn new(entry_date: JournalDate, lines: Vec<JournalLineInput>) -> Self {
         Self {
             entry_date,
+            entry_time: None,
             lines,
             reference: None,
             explanation: None,
         }
+    }
+
+    pub fn with_time(mut self, time: Option<JournalTime>) -> Self {
+        self.entry_time = time;
+        self
     }
 
     pub fn with_header(mut self, reference: Option<String>, explanation: Option<String>) -> Self {
@@ -222,6 +256,7 @@ pub struct DraftJournalLine {
 pub struct DraftJournalEntry {
     pub id: JournalEntryId,
     pub entry_date: JournalDate,
+    pub entry_time: Option<JournalTime>,
     pub revision: i64,
     pub created_at: String,
     pub reference: Option<String>,
@@ -233,10 +268,16 @@ impl PostEntry {
     pub fn new(entry_date: JournalDate, lines: Vec<JournalLineInput>) -> Self {
         Self {
             entry_date,
+            entry_time: None,
             lines,
             reference: None,
             explanation: None,
         }
+    }
+
+    pub fn with_time(mut self, time: Option<JournalTime>) -> Self {
+        self.entry_time = time;
+        self
     }
 
     pub fn with_header(mut self, reference: Option<String>, explanation: Option<String>) -> Self {
@@ -262,6 +303,7 @@ pub struct PostedJournalLine {
 pub struct PostedJournalEntry {
     pub id: JournalEntryId,
     pub entry_date: JournalDate,
+    pub entry_time: Option<JournalTime>,
     pub created_at: String,
     pub posted_at: String,
     pub relationship: PostedEntryRelationship,
@@ -273,8 +315,12 @@ pub struct PostedJournalEntry {
 #[derive(Debug, Error)]
 /// Domain or persistence failure from an atomic posting attempt.
 pub enum JournalError {
+    #[error("explicitly void open-item allocations before reversing this entry")]
+    OpenItemAllocationsActive,
     #[error("invalid journal date {0}; expected an existing date in YYYY-MM-DD form")]
     InvalidDate(String),
+    #[error("invalid journal time {0}; expected HH:mm:ss")]
+    InvalidTime(String),
     #[error(transparent)]
     Validation(#[from] JournalValidationError),
     #[error("journal line refers to missing account {0}")]
@@ -348,12 +394,13 @@ impl JournalRepository {
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
         let (entry_id, revision, created_at): (i64, i64, String) = sqlx::query_as(
             r#"
-            INSERT INTO journal_entries (entry_date, reference, explanation)
-            VALUES (?, ?, ?)
+            INSERT INTO journal_entries (entry_date, entry_time, reference, explanation)
+            VALUES (?, ?, ?, ?)
             RETURNING id, revision, created_at
             "#,
         )
         .bind(input.entry_date.as_str())
+        .bind(input.entry_time.as_ref().map(JournalTime::as_str))
         .bind(input.reference.as_deref())
         .bind(input.explanation.as_deref())
         .fetch_one(&mut *transaction)
@@ -365,6 +412,7 @@ impl JournalRepository {
         Ok(DraftJournalEntry {
             id: JournalEntryId::new(entry_id),
             entry_date: input.entry_date,
+            entry_time: input.entry_time,
             reference: input.reference,
             explanation: input.explanation,
             revision,
@@ -398,6 +446,7 @@ impl JournalRepository {
             r#"
             UPDATE journal_entries
             SET entry_date = ?,
+                entry_time = ?,
                 reference = ?,
                 explanation = ?,
                 revision = revision + 1
@@ -410,6 +459,7 @@ impl JournalRepository {
             "#,
         )
         .bind(input.entry_date.as_str())
+        .bind(input.entry_time.as_ref().map(JournalTime::as_str))
         .bind(input.reference.as_deref())
         .bind(input.explanation.as_deref())
         .bind(id.get())
@@ -435,6 +485,7 @@ impl JournalRepository {
         Ok(DraftJournalEntry {
             id,
             entry_date: input.entry_date,
+            entry_time: input.entry_time,
             reference: input.reference,
             explanation: input.explanation,
             revision,
@@ -448,7 +499,7 @@ impl JournalRepository {
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
         let header: Option<StoredJournalHeader> = sqlx::query_as(
             r#"
-            SELECT entry_date, status, created_at, posted_at, revision, reference, explanation
+            SELECT entry_date, entry_time, status, created_at, posted_at, revision, reference, explanation
             FROM journal_entries
             WHERE id = ?
             "#,
@@ -471,12 +522,14 @@ impl JournalRepository {
         }
         validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
         let entry_date = parse_stored_date(id, &header.entry_date)?;
+        let entry_time = parse_stored_time(header.entry_time.as_deref())?;
         let lines = load_draft_lines(&mut transaction, id).await?;
         transaction.commit().await.map_err(JournalError::Database)?;
 
         Ok(DraftJournalEntry {
             id,
             entry_date,
+            entry_time,
             revision: header.revision,
             created_at: header.created_at,
             reference: header.reference,
@@ -513,7 +566,7 @@ impl JournalRepository {
         }
         let headers: Vec<StoredDraftListHeader> = sqlx::query_as(
             r#"
-            SELECT id, entry_date, revision, created_at, reference, explanation
+            SELECT id, entry_date, entry_time, revision, created_at, reference, explanation
             FROM journal_entries
             WHERE status = 'draft'
             ORDER BY entry_date, id
@@ -577,6 +630,7 @@ impl JournalRepository {
             let StoredDraftListHeader {
                 id: stored_id,
                 entry_date: stored_date,
+                entry_time: stored_time,
                 revision,
                 created_at,
                 reference,
@@ -603,6 +657,7 @@ impl JournalRepository {
             drafts.push(DraftJournalEntry {
                 id,
                 entry_date: parse_stored_date(id, &stored_date)?,
+                entry_time: parse_stored_time(stored_time.as_deref())?,
                 revision,
                 created_at,
                 reference,
@@ -674,7 +729,7 @@ impl JournalRepository {
             .map_err(JournalError::Database)?;
         let header: Option<StoredPostedHeader> = sqlx::query_as(
             r#"
-            SELECT entry_date, created_at, status, revision, posted_at,
+            SELECT entry_date, entry_time, created_at, status, revision, posted_at,
                    reverses_entry_id, corrects_entry_id, explanation, reference
             FROM journal_entries
             WHERE id = ? AND status = 'draft' AND revision = ?
@@ -707,6 +762,7 @@ impl JournalRepository {
             return Err(JournalError::DraftRevisionExhausted(id.get()));
         }
         let entry_date = parse_stored_date(id, &header.entry_date)?;
+        let entry_time = parse_stored_time(header.entry_time.as_deref())?;
         let stored_lines = load_stored_lines(&mut transaction, id).await?;
         let line_inputs = stored_lines_to_inputs(id, &stored_lines)?;
         validate_journal_lines(&line_inputs)?;
@@ -738,6 +794,7 @@ impl JournalRepository {
         Ok(PostedJournalEntry {
             id,
             entry_date,
+            entry_time,
             created_at: header.created_at,
             posted_at,
             relationship,
@@ -771,12 +828,26 @@ impl JournalRepository {
         original_id: JournalEntryId,
         reversal_date: JournalDate,
     ) -> Result<PostedJournalEntry, JournalError> {
+        self.reverse_posted_at(original_id, reversal_date, None)
+            .await
+    }
+
+    pub async fn reverse_posted_at(
+        &self,
+        original_id: JournalEntryId,
+        reversal_date: JournalDate,
+        entry_time: Option<JournalTime>,
+    ) -> Result<PostedJournalEntry, JournalError> {
         let mut transaction = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(JournalError::Database)?;
         let original = load_posted_for_relationship(&mut transaction, original_id).await?;
+        let allocated:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM open_item_allocations x JOIN journal_lines payment ON payment.id=x.settlement_line_id JOIN open_items item ON item.id=x.item_id JOIN open_item_batches batch ON batch.id=item.batch_id JOIN journal_lines source ON source.id=batch.source_line_id WHERE NOT EXISTS(SELECT 1 FROM open_item_allocation_voids v WHERE v.allocation_id=x.id) AND (source.entry_id=? OR payment.entry_id=?))").bind(original_id.get()).bind(original_id.get()).fetch_one(&mut *transaction).await.map_err(JournalError::Database)?;
+        if allocated {
+            return Err(JournalError::OpenItemAllocationsActive);
+        }
         if matches!(
             original.relationship,
             PostedEntryRelationship::Reversal { .. }
@@ -816,7 +887,7 @@ impl JournalRepository {
             .collect();
         let posted = insert_and_post(
             &mut transaction,
-            PostEntry::new(reversal_date, lines),
+            PostEntry::new(reversal_date, lines).with_time(entry_time),
             PostedEntryRelationship::Reversal {
                 original_entry_id: original_id,
             },
@@ -867,7 +938,7 @@ impl JournalRepository {
         let mut transaction = self.pool.begin().await.map_err(JournalError::Database)?;
         let header: Option<StoredPostedHeader> = sqlx::query_as(
             r#"
-            SELECT entry_date, status, created_at, posted_at, revision,
+            SELECT entry_date, entry_time, status, created_at, posted_at, revision,
                    reverses_entry_id, corrects_entry_id, explanation, reference
             FROM journal_entries
             WHERE id = ?
@@ -897,6 +968,7 @@ impl JournalRepository {
         })?;
         validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
         let entry_date = parse_stored_date(id, &header.entry_date)?;
+        let entry_time = parse_stored_time(header.entry_time.as_deref())?;
         let stored_lines = load_stored_lines(&mut transaction, id).await?;
         let validation_lines = stored_lines_to_inputs(id, &stored_lines)?;
         validate_journal_lines(&validation_lines).map_err(|error| {
@@ -916,6 +988,7 @@ impl JournalRepository {
         let posted = PostedJournalEntry {
             id,
             entry_date,
+            entry_time,
             created_at: header.created_at,
             posted_at,
             relationship,
@@ -932,6 +1005,7 @@ impl JournalRepository {
 #[derive(Debug, sqlx::FromRow)]
 struct StoredJournalHeader {
     entry_date: String,
+    entry_time: Option<String>,
     status: String,
     created_at: String,
     posted_at: Option<String>,
@@ -943,6 +1017,7 @@ struct StoredJournalHeader {
 #[derive(Debug, sqlx::FromRow)]
 struct StoredPostedHeader {
     entry_date: String,
+    entry_time: Option<String>,
     status: String,
     created_at: String,
     posted_at: Option<String>,
@@ -969,6 +1044,7 @@ struct StoredJournalLine {
 struct StoredDraftListHeader {
     id: i64,
     entry_date: String,
+    entry_time: Option<String>,
     revision: i64,
     created_at: String,
     reference: Option<String>,
@@ -1010,13 +1086,14 @@ async fn insert_and_post(
     let (entry_id, created_at): (i64, String) = sqlx::query_as(
         r#"
         INSERT INTO journal_entries (
-            entry_date, reverses_entry_id, corrects_entry_id, explanation, reference
+            entry_date, entry_time, reverses_entry_id, corrects_entry_id, explanation, reference
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         RETURNING id, created_at
         "#,
     )
     .bind(input.entry_date.as_str())
+    .bind(input.entry_time.as_ref().map(JournalTime::as_str))
     .bind(reverses_entry_id)
     .bind(corrects_entry_id)
     .bind(explanation.as_deref())
@@ -1078,6 +1155,7 @@ async fn insert_and_post(
     Ok(PostedJournalEntry {
         id: JournalEntryId::new(entry_id),
         entry_date: input.entry_date,
+        entry_time: input.entry_time,
         created_at,
         posted_at,
         relationship,
@@ -1093,7 +1171,7 @@ async fn load_posted_for_relationship(
 ) -> Result<PostedJournalEntry, JournalError> {
     let header: Option<StoredPostedHeader> = sqlx::query_as(
         r#"
-        SELECT entry_date, status, created_at, posted_at, revision,
+        SELECT entry_date, entry_time, status, created_at, posted_at, revision,
                reverses_entry_id, corrects_entry_id, explanation, reference
         FROM journal_entries
         WHERE id = ?
@@ -1139,6 +1217,7 @@ async fn load_posted_for_relationship(
     let posted = PostedJournalEntry {
         id,
         entry_date: parse_stored_date(id, &header.entry_date)?,
+        entry_time: parse_stored_time(header.entry_time.as_deref())?,
         created_at: header.created_at,
         posted_at,
         relationship,
@@ -1531,6 +1610,13 @@ fn stored_line_values(
     ))
 }
 
+fn parse_stored_time(value: Option<&str>) -> Result<Option<JournalTime>, JournalError> {
+    value
+        .map(JournalTime::parse)
+        .transpose()
+        .map_err(|error| JournalError::InvalidStoredValue(error.to_string()))
+}
+
 fn parse_stored_date(id: JournalEntryId, stored: &str) -> Result<JournalDate, JournalError> {
     JournalDate::parse(stored).map_err(|_| {
         JournalError::InvalidStoredValue(format!("entry {} has invalid date {stored}", id.get()))
@@ -1621,7 +1707,7 @@ async fn validate_stored_draft_for_mutation(
 ) -> Result<(), JournalError> {
     let header: Option<StoredPostedHeader> = sqlx::query_as(
         r#"
-        SELECT entry_date, status, created_at, revision, posted_at, reference, explanation, reverses_entry_id, corrects_entry_id
+        SELECT entry_date, entry_time, status, created_at, revision, posted_at, reference, explanation, reverses_entry_id, corrects_entry_id
         FROM journal_entries
         WHERE id = ?
         "#,
@@ -1651,6 +1737,7 @@ async fn validate_stored_draft_for_mutation(
 
     validate_metadata(header.reference.as_deref(), header.explanation.as_deref())?;
     parse_stored_date(id, &header.entry_date)?;
+    parse_stored_time(header.entry_time.as_deref())?;
     load_draft_lines(transaction, id).await?;
     Ok(())
 }

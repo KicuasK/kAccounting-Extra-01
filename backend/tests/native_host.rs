@@ -58,6 +58,27 @@ struct Fixture {
     keys: Arc<Keys>,
 }
 impl Fixture {
+    async fn selection_id(&self) -> String {
+        let response = self
+            .host
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header("host", "127.0.0.1:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let raw = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["selection_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
     async fn new(body: &str) -> Self {
         let mut random = [0; 16];
         getrandom::fill(&mut random).unwrap();
@@ -71,7 +92,7 @@ impl Fixture {
         fs::write(
             &helper,
             format!(
-                "#!/usr/bin/python3\nimport json,sys,os,time\nr=json.load(sys.stdin)\n{body}\n"
+                "#!/usr/bin/python3\nimport json,sys,os,time\nr=json.load(sys.stdin)\ninitial=r.pop('initial_directory',None)\n{body}\n"
             ),
         )
         .unwrap();
@@ -116,6 +137,451 @@ impl Fixture {
             tokio::task::yield_now().await;
         }
     }
+}
+fn browser_request(
+    body: impl Into<Body>,
+    selection: Option<&str>,
+    origin: Option<&str>,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/native/selections")
+        .header("host", "127.0.0.1:3000")
+        .header("content-type", "application/json");
+    if let Some(selection) = selection {
+        request = request.header("x-kaccounting-selection", selection);
+    }
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    request.body(body.into()).unwrap()
+}
+fn create_book_request(body: &'static str, selection: Option<&str>) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/native/books")
+        .header("host", "127.0.0.1:3000")
+        .header("origin", "http://127.0.0.1:3000")
+        .header("content-type", "application/json");
+    if let Some(selection) = selection {
+        request = request.header("x-kaccounting-selection", selection);
+    }
+    request.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn browser_creates_first_book_only_from_real_picker_and_does_not_select_it() {
+    let f = Fixture::new("assert initial==os.getcwd()\nprint(json.dumps(dict(r,result={'outcome':'selected','path':os.path.join(initial,'new-book')})))").await;
+    // Remove only this disposable fixture's pre-created book to exercise an empty collection.
+    fs::remove_dir_all(f.root.join("book")).unwrap();
+    let response = f
+        .host
+        .browser_router()
+        .oneshot(create_book_request("{}", Some("unselected")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let raw = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+        serde_json::json!({"book_id":"new-book","selection_required":true})
+    );
+    assert!(f.root.join("new-book/book.sqlite3").is_file());
+    let response = f
+        .host
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session")
+                .header("host", "127.0.0.1:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let raw = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["book_id"],
+        serde_json::Value::Null
+    );
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_create_rejects_http_paths_stale_guards_and_cancels_without_keys() {
+    let f = Fixture::new(
+        "open('started','w').close()\nprint(json.dumps(dict(r,result={'outcome':'cancelled'})))",
+    )
+    .await;
+    let before = f.keys.0.lock().unwrap().len();
+    for body in [
+        r#"{"path":"/private/tmp/new"}"#,
+        r#"{"book_id":"new"}"#,
+        r#"{"kind":"book-destination"}"#,
+        r#"{"capability_id":"fake"}"#,
+        r#"{"initial_directory":"/private/tmp"}"#,
+        "null",
+    ] {
+        assert_eq!(
+            f.host
+                .browser_router()
+                .oneshot(create_book_request(body, Some("unselected")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        f.host
+            .browser_router()
+            .oneshot(create_book_request("{}", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.host
+            .browser_router()
+            .oneshot(create_book_request(
+                "{}",
+                Some("00000000000000000000000000000000")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(!f.root.join("started").exists());
+    let response = f
+        .host
+        .browser_router()
+        .oneshot(create_book_request("{}", Some("unselected")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+        serde_json::json!({"book_id":null,"selection_required":true})
+    );
+    assert_eq!(f.keys.0.lock().unwrap().len(), before);
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_create_refuses_existing_and_outside_collection_destinations_before_keys() {
+    for destination in [
+        "os.path.join(os.getcwd(),'book')",
+        "os.path.join(os.getcwd(),'assets','nested')",
+        "os.path.join(os.getcwd(),'.hidden-book')",
+    ] {
+        let f = Fixture::new(&format!(
+            "print(json.dumps(dict(r,result={{'outcome':'selected','path':{destination}}})))"
+        ))
+        .await;
+        let before = f.keys.0.lock().unwrap().len();
+        let binding = fs::read(f.root.join("book/device-key.json")).unwrap();
+        let response = f
+            .host
+            .browser_router()
+            .oneshot(create_book_request("{}", Some("unselected")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(f.keys.0.lock().unwrap().len(), before);
+        assert_eq!(
+            fs::read(f.root.join("book/device-key.json")).unwrap(),
+            binding
+        );
+        assert!(!f.root.join("assets/nested").exists());
+        assert!(!f.root.join(".hidden-book").exists());
+        f.host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn browser_create_preserves_selected_book_and_private_router_omits_endpoint() {
+    let f = Fixture::new("print(json.dumps(dict(r,result={'outcome':'selected','path':os.path.join(os.getcwd(),'second-book')})))").await;
+    f.select_book().await;
+    let generation = f.selection_id().await;
+    let response = f
+        .host
+        .router()
+        .oneshot(create_book_request("{}", Some(&generation)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    drop(response);
+    let response = f
+        .host
+        .browser_router()
+        .oneshot(create_book_request("{}", Some(&generation)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    drop(response);
+    assert_eq!(f.selection_id().await, generation);
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_create_refuses_collection_replaced_while_native_panel_is_open() {
+    let f = Fixture::new("old=os.getcwd()\nopen('started','w').close()\ntime.sleep(0.4)\nprint(json.dumps(dict(r,result={'outcome':'selected','path':os.path.join(old,'new-book')})))").await;
+    let before = f.keys.0.lock().unwrap().len();
+    let router = f.host.browser_router();
+    let pending = tokio::spawn(async move {
+        router
+            .oneshot(create_book_request("{}", Some("unselected")))
+            .await
+            .unwrap()
+    });
+    f.wait_marker().await;
+    let moved = f.root.with_extension("moved-private-fixture");
+    fs::rename(&f.root, &moved).unwrap();
+    fs::create_dir(&f.root).unwrap();
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o700)).unwrap();
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(f.keys.0.lock().unwrap().len(), before);
+    assert!(!f.root.join("new-book").exists());
+    f.host.shutdown().await.unwrap();
+    fs::remove_dir_all(moved).unwrap();
+}
+
+#[tokio::test]
+async fn browser_panel_route_is_opt_in_and_requires_origin_and_exact_selected_generation() {
+    let f = Fixture::new(
+        "open('started','w').close()\nprint(json.dumps(dict(r,result={'outcome':'cancelled'})))",
+    )
+    .await;
+    let origin = Some("http://127.0.0.1:3000");
+    let response = f
+        .host
+        .browser_router()
+        .oneshot(browser_request(
+            r#"{"kind":"recovery-parent"}"#,
+            Some("unselected"),
+            origin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    f.select_book().await;
+    let generation = f.selection_id().await;
+    for (guard, origin, expected) in [
+        (None, origin, StatusCode::BAD_REQUEST),
+        (Some("invalid"), origin, StatusCode::BAD_REQUEST),
+        (
+            Some("00000000000000000000000000000000"),
+            origin,
+            StatusCode::CONFLICT,
+        ),
+        (Some(generation.as_str()), None, StatusCode::FORBIDDEN),
+        (
+            Some(generation.as_str()),
+            Some("https://foreign.example"),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let response = f
+            .host
+            .browser_router()
+            .oneshot(browser_request(
+                r#"{"kind":"recovery-parent"}"#,
+                guard,
+                origin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let request = browser_request(r#"{"kind":"recovery-parent"}"#, Some(&generation), origin);
+    let response = f.host.router().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "router used by private Unix ingress must omit panel route"
+    );
+    drop(response);
+    assert!(!f.root.join("started").exists());
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_panel_accepts_only_eight_kinds_and_never_web_paths_or_capabilities() {
+    let f = Fixture::new(
+        "open('started','w').close()\nprint(json.dumps(dict(r,result={'outcome':'cancelled'})))",
+    )
+    .await;
+    f.select_book().await;
+    let generation = f.selection_id().await;
+    for body in [
+        r#"{"kind":"unknown"}"#,
+        r#"{"kind":"book","path":"/private/tmp"}"#,
+        r#"{"kind":"book","capability_id":"fake"}"#,
+        r#"{"kind":"book","helper":"fake"}"#,
+        r#"{"kind":"book","kind":"request"}"#,
+    ] {
+        let response = f
+            .host
+            .browser_router()
+            .oneshot(browser_request(
+                body,
+                Some(&generation),
+                Some("http://127.0.0.1:3000"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response = f
+        .host
+        .browser_router()
+        .oneshot(browser_request(
+            format!("{{\"kind\":\"{}\"}}", "x".repeat(5000)),
+            Some(&generation),
+            Some("http://127.0.0.1:3000"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!f.root.join("started").exists());
+    for kind in [
+        "book",
+        "request",
+        "package",
+        "backup",
+        "request-destination",
+        "export-destination",
+        "book-destination",
+        "recovery-parent",
+    ] {
+        let response = f
+            .host
+            .browser_router()
+            .oneshot(browser_request(
+                format!("{{\"kind\":\"{kind}\"}}"),
+                Some(&generation),
+                Some("http://127.0.0.1:3000"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+            serde_json::json!({"capability_id":null})
+        );
+    }
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_panel_pins_selection_and_refuses_book_switch_until_completion() {
+    let f = Fixture::new("open('started','w').close()\ntime.sleep(0.4)\nprint(json.dumps(dict(r,result={'outcome':'selected','path':os.getcwd()})))").await;
+    f.select_book().await;
+    let generation = f.selection_id().await;
+    let router = f.host.browser_router();
+    let request = browser_request(
+        r#"{"kind":"recovery-parent"}"#,
+        Some(&generation),
+        Some("http://127.0.0.1:3000"),
+    );
+    let pending = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    f.wait_marker().await;
+    let router = f.host.router();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/api/session/selection")
+        .header("host", "127.0.0.1:3000")
+        .header("origin", "http://127.0.0.1:3000")
+        .header("x-kaccounting-selection", &generation)
+        .body(Body::empty())
+        .unwrap();
+    let clearing = router.oneshot(request).await.unwrap();
+    assert_eq!(clearing.status(), StatusCode::CONFLICT);
+    let raw = axum::body::to_bytes(clearing.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["error"]["code"],
+        "book_busy"
+    );
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(
+        result["capability_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    );
+    assert!(!String::from_utf8_lossy(&raw).contains(f.root.to_str().unwrap()));
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/api/session/selection")
+        .header("host", "127.0.0.1:3000")
+        .header("origin", "http://127.0.0.1:3000")
+        .header("x-kaccounting-selection", &generation)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        f.host.router().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_panel_closed_host_and_explicit_cancel_are_bounded() {
+    let f = Fixture::new("open('started','w').close()\ntime.sleep(30)").await;
+    f.select_book().await;
+    let generation = f.selection_id().await;
+    let router = f.host.browser_router();
+    let request = browser_request(
+        r#"{"kind":"recovery-parent"}"#,
+        Some(&generation),
+        Some("http://127.0.0.1:3000"),
+    );
+    let pending = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    f.wait_marker().await;
+    f.host.cancel_selection().await.unwrap();
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+        serde_json::json!({"capability_id":null})
+    );
+    f.host.shutdown().await.unwrap();
+    let response = f
+        .host
+        .browser_router()
+        .oneshot(browser_request(
+            r#"{"kind":"book"}"#,
+            Some(&generation),
+            Some("http://127.0.0.1:3000"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

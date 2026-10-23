@@ -261,7 +261,7 @@ def execute(path: Path, timeout: float = 15) -> dict:
                 verify_http_owner(plan)
                 session = read_json("/api/session")
                 books = read_json("/api/session/books")
-                if session != {"book_id": None, "selection_required": True} or books != {"books": []}:
+                if session != {"book_id": None, "selection_required": True, "selection_id": None} or books != {"books": []}:
                     raise ValueError("Acceptance server did not start as an empty unselected session")
                 verify_http_owner(plan)
                 verified = True

@@ -1,5 +1,5 @@
-//! Trusted in-process native composition. There is no panel HTTP endpoint or
-//! web-supplied helper/path input. Only an explicit host action invokes a panel.
+//! Trusted native composition. The explicit loopback browser router admits only
+//! typed panel actions, never web-supplied helpers, paths or capability IDs.
 use crate::{
     native_selection::{NativePicker, NativeSelectionError},
     session_runtime::SessionRuntime,
@@ -8,11 +8,13 @@ use crate::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
-    http::{Request, StatusCode},
+    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::post,
 };
+use serde::Deserialize;
 use std::{
     path::Path,
     sync::{
@@ -46,6 +48,21 @@ struct Inner {
 #[derive(Clone)]
 pub struct NativeHost(Arc<Inner>);
 impl NativeHost {
+    /// Local browser composition only. Private Unix ingress deliberately uses
+    /// router(), which never includes this native-panel endpoint.
+    pub fn browser_router(&self) -> Router {
+        Router::new()
+            .route("/api/native/selections", post(browser_selection))
+            .route("/api/native/books", post(browser_create_book))
+            .layer(DefaultBodyLimit::max(4096))
+            .with_state(self.clone())
+            .fallback_service(self.router())
+            .layer(middleware::from_fn_with_state(
+                self.clone(),
+                require_open_host,
+            ))
+            .layer(middleware::from_fn(crate::runtime::local_boundary))
+    }
     /// `helper` and owner UID come only from trusted local startup configuration.
     /// Construction pins the helper without executing it or accessing OS keys.
     pub fn new(
@@ -116,6 +133,160 @@ impl NativeHost {
         })
         .await
         .map_err(|_| NativeHostError::ShutdownWorker)?
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BrowserSelectionKind {
+    Book,
+    Request,
+    Package,
+    Backup,
+    RequestDestination,
+    ExportDestination,
+    BookDestination,
+    RecoveryParent,
+}
+impl From<BrowserSelectionKind> for SelectionKind {
+    fn from(value: BrowserSelectionKind) -> Self {
+        match value {
+            BrowserSelectionKind::Book => Self::Book,
+            BrowserSelectionKind::Request => Self::Request,
+            BrowserSelectionKind::Package => Self::Package,
+            BrowserSelectionKind::Backup => Self::Backup,
+            BrowserSelectionKind::RequestDestination => Self::RequestDestination,
+            BrowserSelectionKind::ExportDestination => Self::ExportDestination,
+            BrowserSelectionKind::BookDestination => Self::BookDestination,
+            BrowserSelectionKind::RecoveryParent => Self::RecoveryParent,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserSelectionInput {
+    kind: BrowserSelectionKind,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserCreateBookInput {}
+async fn browser_create_book(
+    State(host): State<NativeHost>,
+    headers: HeaderMap,
+    input: Result<Json<BrowserCreateBookInput>, JsonRejection>,
+) -> Response {
+    if input.is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":{"code":"invalid_native_book_creation"}})),
+        )
+            .into_response();
+    }
+    let guard = match host.0.session.native_creation_guard(&headers).await {
+        Ok(guard) => guard,
+        Err(response) => return *response,
+    };
+    let mut cancellation = host.0.cancellation.subscribe();
+    if host.0.closed.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":{"code":"native_host_closed"}})),
+        )
+            .into_response();
+    }
+    let selected = tokio::select! {
+        biased;
+        _ = cancellation.changed() => if host.0.closed.load(Ordering::Acquire) { Err(NativeHostError::Closed) } else { Ok(None) },
+        selected = host.0.picker.choose_book_destination(host.0.session.native_collection_directory()) => selected.map_err(NativeHostError::from),
+    };
+    match selected {
+        Ok(None) => {
+            Json(serde_json::json!({"book_id":null,"selection_required":true})).into_response()
+        }
+        Ok(Some(path)) => match host.0.session.create_native_book(guard, path).await {
+            Ok(book_id) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"book_id":book_id,"selection_required":true})),
+            )
+                .into_response(),
+            Err(crate::runtime::RuntimeError::UnsafePath) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error":{"code":"invalid_native_book_destination"}})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error":{"code":"native_book_creation_failed"}})),
+            )
+                .into_response(),
+        },
+        Err(NativeHostError::Closed) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":{"code":"native_host_closed"}})),
+        )
+            .into_response(),
+        Err(NativeHostError::Selection(NativeSelectionError::Busy)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":{"code":"native_picker_busy"}})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":{"code":"native_selection_failed"}})),
+        )
+            .into_response(),
+    }
+}
+async fn browser_selection(
+    State(host): State<NativeHost>,
+    headers: HeaderMap,
+    input: Result<Json<BrowserSelectionInput>, JsonRejection>,
+) -> Response {
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":{"code":"invalid_native_selection"}})),
+            )
+                .into_response();
+        }
+    };
+    let guard = match host.0.session.native_action_guard(&headers).await {
+        Ok(guard) => guard,
+        Err(response) => return *response,
+    };
+    let mut cancellation = host.0.cancellation.subscribe();
+    if host.0.closed.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":{"code":"native_host_closed"}})),
+        )
+            .into_response();
+    }
+    let selected = tokio::select! {
+        biased;
+        _ = cancellation.changed() => if host.0.closed.load(Ordering::Acquire) { Err(NativeHostError::Closed) } else { Ok(None) },
+        selected = host.0.picker.select_and_register_guarded(&guard, input.kind.into()) => selected.map_err(NativeHostError::from),
+    };
+    match selected {
+        Ok(capability_id) => {
+            Json(serde_json::json!({"capability_id":capability_id})).into_response()
+        }
+        Err(NativeHostError::Closed) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":{"code":"native_host_closed"}})),
+        )
+            .into_response(),
+        Err(NativeHostError::Selection(NativeSelectionError::Busy)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":{"code":"native_picker_busy"}})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":{"code":"native_selection_failed"}})),
+        )
+            .into_response(),
     }
 }
 async fn require_open_host(

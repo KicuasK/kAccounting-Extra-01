@@ -27,6 +27,8 @@
 - Use `system-ui` for all UI text except Chinese characters inside account names, which use `DFKai-SB` with a safe fallback.
 - Keep English, digits, dates, and amounts in account names in the system font.
 - Right-align amounts and use tabular numerals.
+- Latest user amendment (2026-10-23): remove visible account codes; retain
+  explicit debit/credit balance direction. Do not invent a signed convention.
 - Support Mac Safari in Version 01. Preserve responsive foundations for the
   touch-friendly iPad Safari Version 02; iPhone support is out of scope.
 - Use the traditional General Journal reference recorded in `docs/UI_STYLE_GUIDE.md` for entry structure. Its Version 01 editing interaction is already approved in `docs/VERSION01_DECISIONS.md`; do not ask for that approval again.
@@ -36,7 +38,8 @@
 - Do not expose a public service or enable Tailscale Funnel.
 - Do not modify real financial data during development or tests.
 - Do not finalize ambiguous accounting policies without recording a user decision.
-- Do not implement the journal-entry editor until its detailed interaction design is approved. The supplied General Journal image establishes direction, not a complete interaction specification.
+- The journal-entry editor interaction is approved in VERSION01_DECISIONS.md;
+  proceed within that approval and ask only about new unresolved policies.
 
 ## Engineering practice
 

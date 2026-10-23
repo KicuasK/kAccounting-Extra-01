@@ -43,8 +43,14 @@ capability string. User cancellation returns `None` and registers nothing.
 
 Rust launches the pinned executable directly with an empty environment, fixed
 working directory, private piped stdin/stdout and suppressed stderr. It sends one
-JSON request containing only the exact format, a fresh 256-bit random nonce and
-a typed kind. The child accepts at most 1024 bytes. It returns one JSON response
+JSON request containing the exact format, a fresh 256-bit random nonce and
+a typed kind. First-book creation additionally supplies `initial_directory`
+only from the backend's configured collection, never from browser JSON. The
+helper permits that optional field only for `book_destination`, validates an
+existing absolute canonical non-symlink directory, and starts the save panel
+there. The browser still submits only `{}`; changing directories in the panel
+does not relax the backend's direct-child collection check. The child accepts
+at most 16 KiB, including a bounded directory path. It returns one JSON response
 with matching format/nonce/kind and either `selected` with one absolute canonical
 path or `cancelled`. Rust caps output at 16 KiB and rejects unknown fields,
 wrong kinds/nonces, nonzero exit, unsafe paths and changed helper identity.

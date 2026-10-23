@@ -1,5 +1,13 @@
 # Explicit local book session
 
+2026-10-23 update: the frontend now offers explicit choose/switch/close controls
+and the account browser. `/api/session` additionally returns `selection_id`, an
+opaque generation or null. New browser requests pin `X-kAccounting-Selection`
+to this generation, including select/close (`unselected` when empty). Stale
+requests fail before dispatch or key reads, even after a switch back to the same
+book. See [API](API.md) and [latest build](BUILD_TAKEOVER_2026-10-23.md).
+Older statements below that selection UI is absent are historical.
+
 The session server starts at `127.0.0.1:3000` with no selected book, even if one
 candidate exists. Startup and discovery do not read Keychain. The locally
 configured collection must be private, outside source, and contain only safe

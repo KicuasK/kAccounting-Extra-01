@@ -24,7 +24,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use thiserror::Error;
 
@@ -119,14 +119,31 @@ pub fn load_recovery_book_key(
     })
 }
 
+/// Read-only view of the already loaded key; namespace setup never calls OS key APIs.
+struct RuntimeCachedKey<'a> {
+    id: &'a DeviceKeyId,
+    key: &'a RootEncryptionKey,
+}
+impl DeviceKeyStore for RuntimeCachedKey<'_> {
+    fn read(&self, id: &DeviceKeyId) -> Result<zeroize::Zeroizing<Vec<u8>>, KeyStoreError> {
+        if id != self.id {
+            return Err(KeyStoreError::Missing);
+        }
+        Ok(zeroize::Zeroizing::new(self.key.as_bytes().to_vec()))
+    }
+    fn insert_new(&self, _id: &DeviceKeyId, _bytes: &[u8]) -> Result<(), KeyStoreError> {
+        Err(KeyStoreError::Unavailable(-1))
+    }
+}
 /// Holds the process lock and encryption key for the entire server lifetime.
 /// Call close() on normal shutdown before this object is dropped.
 pub struct RuntimeBook {
     pool: SqlitePool,
     root: PathBuf,
+    root_identity: std::fs::Metadata,
     key_id: DeviceKeyId,
     key: Arc<RootEncryptionKey>,
-    backup_id: Option<crate::backup_service::BookBackupId>,
+    backup_id: Arc<OnceLock<crate::backup_service::BookBackupId>>,
     _lock: File,
 }
 impl RuntimeBook {
@@ -146,7 +163,63 @@ impl RuntimeBook {
         self.key.clone()
     }
     pub fn backup_id(&self) -> Option<&crate::backup_service::BookBackupId> {
-        self.backup_id.as_ref()
+        self.backup_id.get()
+    }
+    pub(crate) fn backup_identity_cell(
+        &self,
+    ) -> Arc<OnceLock<crate::backup_service::BookBackupId>> {
+        self.backup_id.clone()
+    }
+    /// Explicit create-only namespace setup, using only the already loaded key.
+    /// The session owns exclusive admission through this synchronous operation.
+    pub(crate) fn setup_cached_backup_identity(
+        &self,
+    ) -> Result<(), crate::backup_service::BackupServiceError> {
+        crate::storage::ensure_directory_still_matches(&self.root, &self.root_identity)
+            .map_err(|_| crate::backup_service::BackupServiceError::InvalidIdentity)?;
+        if self.backup_id.get().is_some()
+            || std::fs::symlink_metadata(self.root.join("backup-identity.kae")).is_ok()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+        }
+        let keys = RuntimeCachedKey {
+            id: &self.key_id,
+            key: &self.key,
+        };
+        let id =
+            crate::backup_service::initialize_backup_identity(&self.root, &self.key_id, &keys)?;
+        crate::storage::ensure_directory_still_matches(&self.root, &self.root_identity)
+            .map_err(|_| crate::backup_service::BackupServiceError::InvalidIdentity)?;
+        self.backup_id
+            .set(id)
+            .map_err(|_| crate::backup_service::BackupServiceError::InvalidIdentity)
+    }
+    pub(crate) fn cached_backup_identity_status(
+        &self,
+    ) -> Result<bool, crate::backup_service::BackupServiceError> {
+        crate::storage::ensure_directory_still_matches(&self.root, &self.root_identity)
+            .map_err(|_| crate::backup_service::BackupServiceError::InvalidIdentity)?;
+        let path = self.root.join("backup-identity.kae");
+        match std::fs::symlink_metadata(path) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && self.backup_id.get().is_none() =>
+            {
+                return Ok(false);
+            }
+            Err(_) => return Err(crate::backup_service::BackupServiceError::InvalidIdentity),
+            Ok(_) => {}
+        }
+        let keys = RuntimeCachedKey {
+            id: &self.key_id,
+            key: &self.key,
+        };
+        let persisted =
+            crate::backup_service::load_backup_identity(&self.root, &self.key_id, &keys)?;
+        if self.backup_id.get() != Some(&persisted) {
+            return Err(crate::backup_service::BackupServiceError::InvalidIdentity);
+        }
+        Ok(true)
     }
     pub async fn close(&self) {
         self.pool.close().await;
@@ -159,6 +232,7 @@ impl RuntimeBook {
         store: &impl DeviceKeyStore,
     ) -> Result<Self, RuntimeError> {
         let root = private_directory(path.as_ref())?;
+        let root_identity = std::fs::symlink_metadata(&root)?;
         outside_source(&root)?;
         let lock = lock_book(&root)?;
         let recovered = book_backup::recover_interrupted_local_backup_work(&root)?;
@@ -202,12 +276,14 @@ impl RuntimeBook {
                 db::verify_database_snapshot(&database).await?;
             }
             let pool = db::open_database(&database).await?;
+            crate::storage::ensure_directory_still_matches(&root, &root_identity)?;
             Ok(Self {
                 pool,
                 root,
+                root_identity,
                 key_id,
                 key,
-                backup_id,
+                backup_id: Arc::new(backup_id.map_or_else(OnceLock::new, OnceLock::from)),
                 _lock: lock,
             })
         })
@@ -526,7 +602,7 @@ pub async fn serve_session(
 /// Serve the trusted native composition without automatically invoking a panel.
 /// The caller owns explicit native user actions; HTTP never opens a panel.
 pub async fn serve_native_host(host: crate::native_host::NativeHost) -> Result<(), RuntimeError> {
-    let result = serve_loopback_router(host.router()).await;
+    let result = serve_loopback_router(host.browser_router()).await;
     host.shutdown().await?;
     result
 }

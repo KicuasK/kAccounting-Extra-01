@@ -1,5 +1,13 @@
 # Version 01 non-UI remaining work — 2026-10-22
 
+2026-10-23 update: browser selection-generation guards protect new UI requests
+from cross-tab switching. Native helper publication no longer leaves staging
+hardlinks that violate runtime-packaging inputs. A development bundle and disabled
+launch plan were verified; read-only Developer ID preflight is available. The user
+has no signing certificate and selected keeping the development bundle. Permanent
+proxy/login/reboot/production Keychain remain unqualified. See
+[current evidence](BUILD_TAKEOVER_2026-10-23.md).
+
 Source/document audit, refreshed after the evening integration. This checklist distinguishes missing production
 wiring from acceptance that has not yet been exercised. It does not authorize OS
 changes or accessing real books/keys. Existing uncommitted work is preserved.

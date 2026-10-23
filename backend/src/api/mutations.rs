@@ -7,8 +7,8 @@ use super::{
 use crate::accounting::{
     accounts::{AccountError, AccountKind, AccountRepository, AccountingElement, NewAccount},
     journal::{
-        JournalError, JournalLineInput, JournalRepository, JournalSide, PostCorrection, PostEntry,
-        SaveDraftEntry,
+        JournalError, JournalLineInput, JournalRepository, JournalSide, JournalTime,
+        PostCorrection, PostEntry, SaveDraftEntry,
     },
     money::MinorUnits,
 };
@@ -305,6 +305,7 @@ impl LineInput {
 #[serde(deny_unknown_fields)]
 struct EntryInput {
     entry_date: String,
+    entry_time: Option<String>,
     reference: Option<String>,
     explanation: Option<String>,
     lines: Vec<LineInput>,
@@ -318,11 +319,19 @@ impl EntryInput {
                 .map(LineInput::into_domain)
                 .collect::<Result<Vec<_>, _>>()?,
         )
+        .with_time(
+            self.entry_time
+                .as_deref()
+                .map(JournalTime::parse)
+                .transpose()
+                .map_err(journal_error)?,
+        )
         .with_header(self.reference, self.explanation))
     }
     fn into_post(self) -> Result<PostEntry, ApiError> {
         let draft = self.into_draft()?;
         Ok(PostEntry::new(draft.entry_date, draft.lines)
+            .with_time(draft.entry_time)
             .with_header(draft.reference, draft.explanation))
     }
 }
@@ -397,6 +406,7 @@ async fn post_entry(
 #[serde(deny_unknown_fields)]
 struct ReversalInput {
     entry_date: String,
+    entry_time: Option<String>,
 }
 async fn reverse_entry(
     State(state): State<ApiState>,
@@ -406,7 +416,16 @@ async fn reverse_entry(
     let id = parse_journal_entry_id(&id)?;
     let input = payload(input)?;
     let entry = JournalRepository::new(state.pool)
-        .reverse_posted(id, parse_api_date("entry_date", &input.entry_date)?)
+        .reverse_posted_at(
+            id,
+            parse_api_date("entry_date", &input.entry_date)?,
+            input
+                .entry_time
+                .as_deref()
+                .map(JournalTime::parse)
+                .transpose()
+                .map_err(journal_error)?,
+        )
         .await
         .map_err(journal_error)?;
     Ok((StatusCode::CREATED, Json(entry.into())))
@@ -462,6 +481,9 @@ fn account_error(error: AccountError) -> ApiError {
 fn journal_error(error: JournalError) -> ApiError {
     let message = error.to_string();
     match error {
+        JournalError::OpenItemAllocationsActive => ApiError::Conflict {
+            code: "open_item_allocations_active", message,
+        },
         JournalError::EntryNotFound(_) => ApiError::NotFound {
             code: "entry_not_found",
             message,
@@ -483,10 +505,14 @@ fn journal_error(error: JournalError) -> ApiError {
             }
         }
         JournalError::InvalidDate(_)
+        | JournalError::InvalidTime(_)
         | JournalError::InvalidMetadata
         | JournalError::InvalidExplanation => ApiError::BadRequest {
             code: "invalid_journal_input",
             message,
+        },
+        JournalError::Database(ref error) if error.as_database_error().is_some_and(|e|e.message().contains("payment memo draft no longer matches its payment plan")) => ApiError::Conflict {
+            code: "payment_memo_conflict", message: "The payment draft no longer matches its plan. Reload and review the draft before posting.".into()
         },
         JournalError::Database(_) | JournalError::InvalidStoredValue(_) => ApiError::Internal,
         _ => ApiError::Unprocessable {

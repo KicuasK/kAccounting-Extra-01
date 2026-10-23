@@ -12,6 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 mod book_commands;
 mod container_upload;
 mod mutations;
+mod open_items;
+mod payment_memos;
 mod storage_commands;
 mod transfer_download;
 use sqlx::SqlitePool;
@@ -87,6 +89,8 @@ pub fn router(pool: SqlitePool) -> Router {
 
 fn read_routes() -> Router<ApiState> {
     Router::new()
+        .merge(payment_memos::read_routes())
+        .merge(open_items::read_routes())
         .route("/api/health", get(health))
         .route("/api/accounts", get(list_accounts))
         .route("/api/accounts/tree", get(account_tree))
@@ -122,6 +126,8 @@ fn read_routes() -> Router<ApiState> {
 pub fn localhost_write_router(pool: SqlitePool) -> Router {
     read_routes()
         .merge(mutations::routes())
+        .merge(payment_memos::write_routes())
+        .merge(open_items::write_routes())
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(
             ApiState {
@@ -443,6 +449,7 @@ impl From<DraftJournalLine> for DraftLineResponse {
 struct DraftResponse {
     id: ExactInteger,
     entry_date: String,
+    entry_time: Option<String>,
     revision: ExactInteger,
     created_at: String,
     lines: Vec<DraftLineResponse>,
@@ -455,6 +462,10 @@ impl From<DraftJournalEntry> for DraftResponse {
         Self {
             id: draft.id.get().into(),
             entry_date: draft.entry_date.as_str().to_owned(),
+            entry_time: draft
+                .entry_time
+                .as_ref()
+                .map(|time| time.as_str().to_owned()),
             revision: draft.revision.into(),
             created_at: draft.created_at,
             reference: draft.reference,
@@ -502,6 +513,7 @@ struct PostedLineResponse {
 struct PostedEntryResponse {
     id: ExactInteger,
     entry_date: String,
+    entry_time: Option<String>,
     created_at: String,
     posted_at: String,
     lines: Vec<PostedLineResponse>,
@@ -527,6 +539,10 @@ impl From<PostedJournalEntry> for PostedEntryResponse {
             original_entry_id,
             id: entry.id.get().into(),
             entry_date: entry.entry_date.as_str().to_owned(),
+            entry_time: entry
+                .entry_time
+                .as_ref()
+                .map(|time| time.as_str().to_owned()),
             created_at: entry.created_at,
             posted_at: entry.posted_at,
             reference: entry.reference,
@@ -721,6 +737,7 @@ struct LedgerLineResponse {
     entry_id: ExactInteger,
     line_id: ExactInteger,
     entry_date: String,
+    entry_time: Option<String>,
     line_no: ExactInteger,
     side: &'static str,
     amount_minor: ExactInteger,
@@ -764,6 +781,10 @@ impl From<PeriodGeneralLedger> for PeriodLedgerResponse {
                     entry_id: line.entry_id.get().into(),
                     line_id: line.line_id.get().into(),
                     entry_date: line.entry_date.as_str().to_owned(),
+                    entry_time: line
+                        .entry_time
+                        .as_ref()
+                        .map(|time| time.as_str().to_owned()),
                     line_no: line.line_no.into(),
                     side: line.side.as_str(),
                     amount_minor: line.amount.get().into(),
@@ -811,6 +832,7 @@ struct GeneralJournalLineResponse {
 struct GeneralJournalEntryResponse {
     id: ExactInteger,
     entry_date: String,
+    entry_time: Option<String>,
     posted_at: String,
     lines: Vec<GeneralJournalLineResponse>,
     debit_total_minor: ExactInteger,
@@ -839,6 +861,10 @@ impl From<GeneralJournal> for GeneralJournalResponse {
                 .map(|entry| GeneralJournalEntryResponse {
                     id: entry.id.get().into(),
                     entry_date: entry.entry_date.as_str().to_owned(),
+                    entry_time: entry
+                        .entry_time
+                        .as_ref()
+                        .map(|time| time.as_str().to_owned()),
                     posted_at: entry.posted_at,
                     reference: entry.reference,
                     explanation: entry.explanation,

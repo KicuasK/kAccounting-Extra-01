@@ -8,6 +8,26 @@ import unittest
 
 
 class CanonicalNativeSelectionTests(unittest.TestCase):
+    def test_trusted_initial_directory_is_canonical_existing_directory_for_book_destination_only(self):
+        source = (Path(__file__).resolve().parent.parent / 'native/StoragePicker.swift').read_text()
+        functions = []
+        for name in ['posixCanonicalPath', 'validatedInitialDirectoryPath']:
+            start = source.index('func ' + name + '(')
+            end = source.index('\n}', start) + 2
+            functions.append(source[start:end])
+        with tempfile.TemporaryDirectory(prefix='ka-native-initial-') as temporary:
+            root = Path(temporary).resolve()
+            alias = root / 'alias'; alias.symlink_to(root, target_is_directory=True)
+            file = root / 'file'; file.write_text('fixture')
+            checks = ['precondition(validatedInitialDirectoryPath(' + json.dumps(str(root)) + ', kind: "book_destination") == ' + json.dumps(str(root)) + ')']
+            for path in [str(alias), str(file), str(root / 'missing'), 'relative', '/tmp', str(root) + '/.', str(root) + '/\n']:
+                checks.append('precondition(validatedInitialDirectoryPath(' + json.dumps(path) + ', kind: "book_destination") == nil)')
+            checks.append('precondition(validatedInitialDirectoryPath(' + json.dumps(str(root)) + ', kind: "request_destination") == nil)')
+            checks.append('print("PASS: trusted initial directory validated without opening panel")')
+            program = 'import Foundation\nimport Darwin\n' + '\n'.join(functions + checks)
+            cache = os.environ.get('NATIVE_SWIFT_MODULE_CACHE', str(root / 'module-cache'))
+            result = subprocess.run(['/usr/bin/swift', '-module-cache-path', cache, '-e', program], check=True, text=True, capture_output=True)
+        self.assertIn('PASS:', result.stdout)
     def test_foundation_shortened_paths_match_posix_canonical_paths(self):
         source = (Path(__file__).resolve().parent.parent / 'native/StoragePicker.swift').read_text()
         start = source.index('func posixCanonicalPath(')

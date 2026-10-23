@@ -132,7 +132,7 @@ class LoginAcceptanceTests(unittest.TestCase):
                 return subprocess.CompletedProcess(arguments, 0, "", "")
             self.fail("unexpected launchctl command")
         def read_json(route):
-            return {"book_id": None, "selection_required": True} if route == "/api/session" else {"books": []}
+            return {"book_id": None, "selection_required": True, "selection_id": None} if route == "/api/session" else {"books": []}
         with mock.patch.object(MODULE, "launch", side_effect=launch), \
              mock.patch.object(MODULE, "port_available", return_value=True), \
              mock.patch.object(MODULE, "verify_http_owner", side_effect=ValueError("wrong fixture") if http_error else None), \

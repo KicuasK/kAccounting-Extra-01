@@ -71,16 +71,35 @@ struct Options {
     chooser: bool,
     transfer: bool,
     private_config: Option<PathBuf>,
+    ui: bool,
+    native_helper: Option<PathBuf>,
+    legacy_restore: bool,
+    planning: bool,
 }
 fn parse_options(args: Vec<std::ffi::OsString>) -> Result<Options, &'static str> {
     let Some(assets) = args.first() else {
         return Err(
-            "usage: local_acceptance <frontend-dist> [--chooser | --chooser-transfer [--private-config <external-config>]]",
+            "usage: local_acceptance <frontend-dist> [--chooser | --chooser-ui [--native-helper <helper>] | --chooser-legacy-ui [--native-helper <helper>] | --chooser-planning-ui [--native-helper <helper>] | --chooser-transfer [--private-config <external-config>]]",
         );
     };
     let (chooser, transfer, private_config) = match &args[1..] {
         [] => (false, false, None),
-        [mode] if mode == "--chooser" => (true, false, None),
+        [mode]
+            if mode == "--chooser"
+                || mode == "--chooser-ui"
+                || mode == "--chooser-legacy-ui"
+                || mode == "--chooser-planning-ui" =>
+        {
+            (true, false, None)
+        }
+        [mode, flag, _path]
+            if (mode == "--chooser-ui"
+                || mode == "--chooser-legacy-ui"
+                || mode == "--chooser-planning-ui")
+                && flag == "--native-helper" =>
+        {
+            (true, false, None)
+        }
         [mode] if mode == "--chooser-transfer" => (true, true, None),
         [mode, flag, path] if mode == "--chooser-transfer" && flag == "--private-config" => {
             (true, true, Some(PathBuf::from(path)))
@@ -92,6 +111,22 @@ fn parse_options(args: Vec<std::ffi::OsString>) -> Result<Options, &'static str>
         chooser,
         transfer,
         private_config,
+        ui: args.get(1).is_some_and(|mode| {
+            mode == "--chooser-ui"
+                || mode == "--chooser-legacy-ui"
+                || mode == "--chooser-planning-ui"
+        }),
+        planning: args
+            .get(1)
+            .is_some_and(|mode| mode == "--chooser-planning-ui"),
+        legacy_restore: args
+            .get(1)
+            .is_some_and(|mode| mode == "--chooser-legacy-ui"),
+        native_helper: if args.get(2).is_some_and(|flag| flag == "--native-helper") {
+            args.get(3).map(PathBuf::from)
+        } else {
+            None
+        },
     })
 }
 fn copy_assets(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
@@ -122,6 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chooser,
         transfer,
         private_config,
+        ui,
+        native_helper,
+        legacy_restore,
+        planning,
     } = parse_options(std::env::args_os().skip(1).collect())?;
     // Validate external private configuration before creating any fixture/key.
     let private = private_config
@@ -156,14 +195,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = RuntimeBook::init_new(fixture.0.join("book"), keys.as_ref()).await?;
     let book = RuntimeBook::open_existing(path, keys.as_ref()).await?;
     let accounts = AccountRepository::new(book.pool().clone());
+    let parent = if ui {
+        Some(
+            accounts
+                .create(NewAccount::new(
+                    None,
+                    "驗收資產 Assets",
+                    AccountingElement::Asset,
+                    AccountKind::Category,
+                ))
+                .await?
+                .id,
+        )
+    } else {
+        None
+    };
     let cash = accounts
         .create(NewAccount::new(
-            None,
+            parent,
             format!("驗收現金 Cash {token}"),
             AccountingElement::Asset,
             AccountKind::Posting,
         ))
         .await?;
+    if ui {
+        let inactive = accounts
+            .create(NewAccount::new(
+                parent,
+                "驗收停用科目",
+                AccountingElement::Asset,
+                AccountKind::Posting,
+            ))
+            .await?;
+        accounts
+            .set_active(inactive.id, inactive.revision, false)
+            .await?;
+        for (name, element) in [
+            ("驗收負債", AccountingElement::Liability),
+            ("驗收收益", AccountingElement::Income),
+            ("驗收費損", AccountingElement::Expense),
+        ] {
+            accounts
+                .create(NewAccount::new(None, name, element, AccountKind::Posting))
+                .await?;
+        }
+        RuntimeBook::init_new(fixture.0.join("empty"), keys.as_ref()).await?;
+    }
     let equity = accounts
         .create(NewAccount::new(
             None,
@@ -177,8 +254,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PostEntry::new(
                 JournalDate::parse("2026-10-22")?,
                 vec![
-                    JournalLineInput::new(cash.id, JournalSide::Debit, MinorUnits::new(1000)),
-                    JournalLineInput::new(equity.id, JournalSide::Credit, MinorUnits::new(1000)),
+                    JournalLineInput::new(
+                        cash.id,
+                        JournalSide::Debit,
+                        MinorUnits::new(if ui { 9_007_199_254_740_993 } else { 1000 }),
+                    ),
+                    JournalLineInput::new(
+                        equity.id,
+                        JournalSide::Credit,
+                        MinorUnits::new(if ui { 9_007_199_254_740_993 } else { 1000 }),
+                    ),
                 ],
             )
             .with_header(
@@ -187,6 +272,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         )
         .await?;
+    if planning {
+        // Separate fictitious AR/AP accounts avoid classifying the cash opening
+        // line as a receivable merely to exercise the user interface.
+        let ar = accounts
+            .create(NewAccount::new(
+                None,
+                "驗收應收",
+                AccountingElement::Asset,
+                AccountKind::Posting,
+            ))
+            .await?;
+        let ap = accounts
+            .create(NewAccount::new(
+                None,
+                "驗收應付",
+                AccountingElement::Liability,
+                AccountKind::Posting,
+            ))
+            .await?;
+        let expense = accounts
+            .create(NewAccount::new(
+                None,
+                "驗收服務費用",
+                AccountingElement::Expense,
+                AccountKind::Posting,
+            ))
+            .await?;
+        let income = accounts
+            .create(NewAccount::new(
+                None,
+                "驗收服務收益",
+                AccountingElement::Income,
+                AccountKind::Posting,
+            ))
+            .await?;
+        for (label, debit, credit, amount) in [
+            ("AR", ar.id, income.id, 500),
+            ("AP", expense.id, ap.id, 300),
+            ("AR-RECEIPT", cash.id, ar.id, 100),
+            ("AP-PAYMENT", ap.id, cash.id, 75),
+        ] {
+            let entry = JournalRepository::new(book.pool().clone())
+                .post(
+                    PostEntry::new(
+                        JournalDate::parse("2026-10-23")?,
+                        vec![
+                            JournalLineInput::new(
+                                debit,
+                                JournalSide::Debit,
+                                MinorUnits::new(amount),
+                            ),
+                            JournalLineInput::new(
+                                credit,
+                                JournalSide::Credit,
+                                MinorUnits::new(amount),
+                            ),
+                        ],
+                    )
+                    .with_header(
+                        Some(format!("TEST-{label}")),
+                        Some("Disposable planning acceptance only".into()),
+                    ),
+                )
+                .await?;
+            eprintln!("PLANNING-{label}: entry={} amount={amount}", entry.id.get());
+        }
+    }
+    if legacy_restore {
+        // Exercise the real old backup/restore format, which intentionally does
+        // not confer the source book's managed-retention namespace.
+        let backup = fixture.0.join("legacy-source.kabackup");
+        kaccounting_backend::book_backup::create_local_backup(
+            book.pool(),
+            book.attachments(),
+            &backup,
+            book.key_id(),
+            keys.as_ref(),
+        )
+        .await?;
+        let restored = fixture.0.join("legacy-restored");
+        kaccounting_backend::book_backup::restore_local_backup(&backup, &restored, keys.as_ref())
+            .await?;
+        if restored.join("backup-identity.kae").try_exists()? {
+            return Err("legacy acceptance unexpectedly inherited a backup identity".into());
+        }
+        eprintln!(
+            "LEGACY-RESTORED-ID: legacy-restored — actual verified backup/restore; no managed backup identity"
+        );
+    }
     eprintln!(
         "DISPOSABLE TEST SERVER {} — no real financial data or Keychain; Control-C cleans the fixture.",
         if private.is_some() {
@@ -259,6 +433,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("CHOOSER: explicit selection required; disposable book_id=book");
         if let Some((policy, socket)) = private {
             serve_private_session(session, policy, socket).await?;
+        } else if let Some(helper) = native_helper {
+            use std::os::unix::fs::MetadataExt;
+            let host = kaccounting_backend::native_host::NativeHost::new(
+                session,
+                &helper,
+                std::fs::metadata(&fixture.0)?.uid(),
+            )?;
+            kaccounting_backend::runtime::serve_native_host(host).await?;
         } else {
             serve_session(session).await?;
         }
@@ -280,6 +462,18 @@ mod tests {
     fn modes_are_explicit_and_private_requires_transfer() {
         assert!(!options(&["/invented/assets"]).unwrap().chooser);
         assert!(options(&["/invented/assets", "--chooser"]).unwrap().chooser);
+        assert!(options(&["/invented/assets", "--chooser-ui"]).unwrap().ui);
+        let planning = options(&["/invented/assets", "--chooser-planning-ui"]).unwrap();
+        assert!(planning.ui && planning.chooser && planning.planning && !planning.legacy_restore);
+        let legacy = options(&[
+            "/invented/assets",
+            "--chooser-legacy-ui",
+            "--native-helper",
+            "/private/helper",
+        ])
+        .unwrap();
+        assert!(legacy.ui && legacy.chooser && legacy.legacy_restore);
+        assert_eq!(legacy.native_helper, Some(PathBuf::from("/private/helper")));
         assert!(
             options(&["/invented/assets", "--chooser-transfer"])
                 .unwrap()

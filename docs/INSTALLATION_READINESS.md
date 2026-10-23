@@ -1,5 +1,16 @@
 # Local installation readiness
 
+2026-10-23: `scripts/check-macos-signature.py --binary <absolute-executable>
+--identifier <expected-identifier> [--team-id <expected-team>]` performs read-only
+codesign verification. With an expected team it also tests the Apple anchor,
+Developer ID Application certificate marker, exact team and identifier. Ad-hoc
+validity is distinct from Developer ID qualification; hardened runtime and the
+expected identity/team are required. It does not sign, query keys, install, start,
+notarize or establish Keychain/login/proxy acceptance. Exit 0 qualifies the
+signature, 1 means unqualified, 2 means refused/unavailable. The user currently
+has no certificate and selected keeping the development bundle. See
+[latest build](BUILD_TAKEOVER_2026-10-23.md).
+
 This project can prepare and validate a **disabled login-launcher plan**. It does
 not install a LaunchAgent, modify login settings, execute the selected program,
 open a browser, read keys, or open a book. Actual login acceptance remains pending

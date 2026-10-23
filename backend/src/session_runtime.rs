@@ -9,8 +9,8 @@ use crate::{
 use axum::{
     Json, Router,
     body::{Body, BodyDataStream, Bytes},
-    extract::{DefaultBodyLimit, State},
-    http::{Request, StatusCode},
+    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    http::{HeaderMap, Request, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -52,6 +52,7 @@ impl RecipientKeyStore for Recipient {
 }
 struct Selected {
     id: String,
+    selection_id: String,
     native_epoch: Arc<()>,
     book: Arc<RuntimeBook>,
     operations: StorageOperations,
@@ -70,10 +71,52 @@ pub struct SessionRuntime {
 /// Returning to the same book after a switch does not revive an old token.
 #[derive(Clone)]
 pub struct NativeSelectionSession(Arc<()>);
+/// Browser native actions pin the selected generation until panel completion.
+/// Registration uses this existing lease, never a nested fair-lock read.
+pub(crate) struct NativeActionGuard(OwnedRwLockReadGuard<Option<Selected>>, std::fs::Metadata);
+impl NativeActionGuard {
+    pub(crate) fn register(
+        &self,
+        kind: crate::storage_operations::SelectionKind,
+        path: impl AsRef<Path>,
+    ) -> Result<String, crate::storage_operations::OperationError> {
+        self.0
+            .as_ref()
+            .ok_or(crate::storage_operations::OperationError::InvalidSelection)?
+            .operations
+            .register_selection(kind, path)
+    }
+}
 #[derive(Serialize)]
 struct SessionStatus {
     book_id: Option<String>,
     selection_required: bool,
+    selection_id: Option<String>,
+}
+const SELECTION_HEADER: &str = "x-kaccounting-selection";
+fn expected_selection(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let mut values = headers.get_all(SELECTION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    if value != "unselected"
+        && (value.len() != 32
+            || !value
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+    {
+        return Err(());
+    }
+    Ok(Some(value.to_owned()))
+}
+fn selection_matches(expected: Option<&str>, selected: Option<&Selected>) -> bool {
+    expected.is_none_or(|expected| {
+        expected == selected.map_or("unselected", |selected| selected.selection_id.as_str())
+    })
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +127,96 @@ fn error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(serde_json::json!({"error": {"code": code}}))).into_response()
 }
 impl SessionRuntime {
+    /// Trusted startup configuration only; never supplied by HTTP JSON.
+    pub(crate) fn native_collection_directory(&self) -> &Path {
+        self.parent.as_path()
+    }
+    pub(crate) async fn native_action_guard(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<NativeActionGuard, Box<Response>> {
+        self.native_guard(headers, true).await
+    }
+    pub(crate) async fn native_creation_guard(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<NativeActionGuard, Box<Response>> {
+        self.native_guard(headers, false).await
+    }
+    async fn native_guard(
+        &self,
+        headers: &HeaderMap,
+        require_selected: bool,
+    ) -> Result<NativeActionGuard, Box<Response>> {
+        let expected = expected_selection(headers)
+            .map_err(|_| Box::new(error(StatusCode::BAD_REQUEST, "invalid_selection_guard")))?
+            .ok_or_else(|| Box::new(error(StatusCode::BAD_REQUEST, "invalid_selection_guard")))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Box::new(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_closed",
+            )));
+        }
+        let lease = self.selected.clone().read_owned().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Box::new(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_closed",
+            )));
+        }
+        if !selection_matches(Some(&expected), lease.as_ref()) {
+            return Err(Box::new(error(StatusCode::CONFLICT, "selection_changed")));
+        }
+        if require_selected && lease.is_none() {
+            return Err(Box::new(error(StatusCode::CONFLICT, "selection_required")));
+        }
+        let parent_identity = std::fs::symlink_metadata(self.parent.as_ref())
+            .map_err(|_| Box::new(error(StatusCode::CONFLICT, "book_collection_unavailable")))?;
+        if !parent_identity.is_dir() || parent_identity.file_type().is_symlink() {
+            return Err(Box::new(error(
+                StatusCode::CONFLICT,
+                "book_collection_unavailable",
+            )));
+        }
+        Ok(NativeActionGuard(lease, parent_identity))
+    }
+    /// A trusted picker destination may initialize only one new visible direct
+    /// child of this configured collection. Keep the admission lease inside an
+    /// owned worker so disconnect cannot interrupt publication or release it early.
+    pub(crate) async fn create_native_book(
+        &self,
+        guard: NativeActionGuard,
+        path: PathBuf,
+    ) -> Result<String, RuntimeError> {
+        if path.parent() != Some(self.parent.as_path()) {
+            return Err(RuntimeError::UnsafePath);
+        }
+        let id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RuntimeError::UnsafePath)?;
+        if id.is_empty()
+            || id.len() > 255
+            || id.starts_with('.')
+            || id.contains(['/', '\\'])
+            || id.chars().any(char::is_control)
+        {
+            return Err(RuntimeError::UnsafePath);
+        }
+        let id = id.to_owned();
+        let session = self.clone();
+        tokio::spawn(async move {
+            let _lease = guard;
+            if session.closed.load(Ordering::Acquire) {
+                return Err(RuntimeError::Worker);
+            }
+            crate::storage::ensure_directory_still_matches(session.parent.as_ref(), &_lease.1)?;
+            RuntimeBook::init_new(path, session.device.as_ref()).await?;
+            Ok(id)
+        })
+        .await
+        .map_err(|_| RuntimeError::Worker)?
+    }
     /// The collection is preconfigured locally. Construction/discovery never reads keys.
     pub fn new<D, R>(
         parent: impl AsRef<Path>,
@@ -110,6 +243,10 @@ impl SessionRuntime {
             .route("/api/session", get(status))
             .route("/api/session/books", get(books))
             .route("/api/session/selection", post(select).delete(deselect))
+            .route(
+                "/api/backups/identity",
+                get(backup_identity_status).post(setup_backup_identity),
+            )
             .fallback(dispatch)
             .layer(DefaultBodyLimit::max(4096))
             .with_state(self.clone())
@@ -179,7 +316,7 @@ impl SessionRuntime {
         }
         *selected = None;
     }
-    async fn choose(&self, id: String) -> Response {
+    async fn choose(&self, id: String, expected: Option<String>) -> Response {
         // Reject all path syntax, hidden work names and unlisted candidates before key access.
         if id.is_empty()
             || id.starts_with('.')
@@ -196,6 +333,9 @@ impl SessionRuntime {
         if self.closed.load(Ordering::Acquire) {
             return error(StatusCode::SERVICE_UNAVAILABLE, "session_closed");
         }
+        if !selection_matches(expected.as_deref(), selected.as_ref()) {
+            return error(StatusCode::CONFLICT, "selection_changed");
+        }
         if let Some(active) = selected.as_ref() {
             if !active.operations.is_idle() {
                 return error(StatusCode::CONFLICT, "book_busy");
@@ -204,6 +344,7 @@ impl SessionRuntime {
                 return Json(SessionStatus {
                     book_id: Some(id),
                     selection_required: false,
+                    selection_id: Some(active.selection_id.clone()),
                 })
                 .into_response();
             }
@@ -215,6 +356,11 @@ impl SessionRuntime {
         if !candidates.iter().any(|book| book.id == id) {
             return error(StatusCode::NOT_FOUND, "book_not_available");
         }
+        let mut random = [0; 16];
+        if getrandom::fill(&mut random).is_err() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "session_worker_failed");
+        }
+        let selection_id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let book =
             match RuntimeBook::open_existing(self.parent.join(&id), self.device.as_ref()).await {
                 Ok(v) => Arc::new(v),
@@ -254,6 +400,7 @@ impl SessionRuntime {
             ));
         let previous = selected.replace(Selected {
             id: id.clone(),
+            selection_id: selection_id.clone(),
             native_epoch: Arc::new(()),
             book,
             operations,
@@ -265,10 +412,11 @@ impl SessionRuntime {
         Json(SessionStatus {
             book_id: Some(id),
             selection_required: false,
+            selection_id: Some(selection_id),
         })
         .into_response()
     }
-    async fn clear(&self) -> Response {
+    async fn clear(&self, expected: Option<String>) -> Response {
         let Ok(mut selected) = self.selected.clone().try_write_owned() else {
             return error(StatusCode::CONFLICT, "book_busy");
         };
@@ -276,6 +424,9 @@ impl SessionRuntime {
         // drained by shutdown; a delayed transition can never run after it.
         if self.closed.load(Ordering::Acquire) {
             return error(StatusCode::SERVICE_UNAVAILABLE, "session_closed");
+        }
+        if !selection_matches(expected.as_deref(), selected.as_ref()) {
+            return error(StatusCode::CONFLICT, "selection_changed");
         }
         if selected
             .as_ref()
@@ -289,6 +440,7 @@ impl SessionRuntime {
         Json(SessionStatus {
             book_id: None,
             selection_required: true,
+            selection_id: None,
         })
         .into_response()
     }
@@ -298,6 +450,7 @@ async fn status(State(session): State<SessionRuntime>) -> Response {
     Json(SessionStatus {
         book_id: selected.as_ref().map(|b| b.id.clone()),
         selection_required: selected.is_none(),
+        selection_id: selected.as_ref().map(|b| b.selection_id.clone()),
     })
     .into_response()
 }
@@ -309,17 +462,106 @@ async fn books(State(session): State<SessionRuntime>) -> Response {
 }
 async fn select(
     State(session): State<SessionRuntime>,
+    headers: HeaderMap,
     Json(input): Json<SelectionInput>,
 ) -> Response {
+    let Ok(expected) = expected_selection(&headers) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_selection_guard");
+    };
     // Own transitions despite disconnect/cancellation, including SQLite migrations.
-    tokio::spawn(async move { session.choose(input.book_id).await })
+    tokio::spawn(async move { session.choose(input.book_id, expected).await })
         .await
         .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session_worker_failed"))
 }
-async fn deselect(State(session): State<SessionRuntime>) -> Response {
-    tokio::spawn(async move { session.clear().await })
+async fn deselect(State(session): State<SessionRuntime>, headers: HeaderMap) -> Response {
+    let Ok(expected) = expected_selection(&headers) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_selection_guard");
+    };
+    tokio::spawn(async move { session.clear(expected).await })
         .await
         .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session_worker_failed"))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupIdentityInput {}
+async fn backup_identity_status(
+    State(session): State<SessionRuntime>,
+    headers: HeaderMap,
+) -> Response {
+    let guard = match session.native_action_guard(&headers).await {
+        Ok(guard) => guard,
+        Err(response) => return *response,
+    };
+    tokio::task::spawn_blocking(move || {
+        let Some(active) = guard.0.as_ref() else {
+            return error(StatusCode::CONFLICT, "selection_required");
+        };
+        let result = active.book.cached_backup_identity_status();
+        match result {
+            Ok(initialized) => Json(serde_json::json!({"initialized":initialized})).into_response(),
+            Err(_) => error(StatusCode::CONFLICT, "backup_identity_invalid"),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session_worker_failed"))
+}
+async fn setup_backup_identity(
+    State(session): State<SessionRuntime>,
+    headers: HeaderMap,
+    input: Result<Json<BackupIdentityInput>, JsonRejection>,
+) -> Response {
+    if input.is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    }
+    let expected = match expected_selection(&headers) {
+        Ok(Some(expected)) => expected,
+        _ => return error(StatusCode::BAD_REQUEST, "invalid_selection_guard"),
+    };
+    if session.closed.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "session_closed");
+    }
+    let Ok(selected) = session.selected.clone().try_write_owned() else {
+        return error(StatusCode::CONFLICT, "backup_busy");
+    };
+    if session.closed.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "session_closed");
+    }
+    if !selection_matches(Some(&expected), selected.as_ref()) {
+        return error(StatusCode::CONFLICT, "selection_changed");
+    }
+    let Some(active) = selected.as_ref() else {
+        return error(StatusCode::CONFLICT, "selection_required");
+    };
+    if !active.operations.is_idle() {
+        return error(StatusCode::CONFLICT, "backup_busy");
+    }
+    let book = active.book.clone();
+    // This owned worker and exclusive selection lease survive a disconnected
+    // caller, so shutdown drains setup and no other book inherits its result.
+    tokio::task::spawn_blocking(move || {
+        let _lease = selected;
+        match book.setup_cached_backup_identity() {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"initialized":true})),
+            )
+                .into_response(),
+            Err(crate::backup_service::BackupServiceError::Io(error_value))
+                if error_value.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                error(StatusCode::CONFLICT, "backup_identity_exists")
+            }
+            Err(crate::backup_service::BackupServiceError::InvalidIdentity) => {
+                error(StatusCode::CONFLICT, "backup_identity_invalid")
+            }
+            Err(_) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backup_identity_initialization_failed",
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "session_worker_failed"))
 }
 async fn dispatch(State(session): State<SessionRuntime>, request: Request<Body>) -> Response {
     if request.uri().path() == "/" || request.uri().path().starts_with("/assets/") {
@@ -331,9 +573,15 @@ async fn dispatch(State(session): State<SessionRuntime>, request: Request<Body>)
     if session.closed.load(Ordering::Acquire) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "session_closed");
     }
+    let Ok(expected) = download_selection(&request) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_selection_guard");
+    };
     let lease = session.selected.clone().read_owned().await;
     if session.closed.load(Ordering::Acquire) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "session_closed");
+    }
+    if !selection_matches(expected.as_deref(), lease.as_ref()) {
+        return error(StatusCode::CONFLICT, "selection_changed");
     }
     let Some(active) = lease.as_ref() else {
         return error(StatusCode::CONFLICT, "selection_required");
@@ -350,6 +598,51 @@ async fn dispatch(State(session): State<SessionRuntime>, request: Request<Body>)
             _lease: Some(lease),
         }),
     )
+}
+
+// Browser-native downloads cannot attach a custom header. Only these binary
+// GET routes accept a mandatory generation query, checked under the same lease.
+fn download_selection(request: &Request<Body>) -> Result<Option<String>, ()> {
+    let header = expected_selection(request.headers())?;
+    let query = request.uri().query().unwrap_or("");
+    if !query
+        .split('&')
+        .any(|part| part.split('=').next() == Some("download_selection"))
+    {
+        return Ok(header);
+    }
+    let path = request.uri().path();
+    let attachment = path
+        .strip_prefix("/api/attachments/")
+        .and_then(|s| s.strip_suffix("/content"))
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        });
+    let export = path
+        .strip_prefix("/api/storage/operations/")
+        .and_then(|s| s.strip_suffix("/download"))
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        });
+    if request.method() != axum::http::Method::GET || !(attachment || export) {
+        return Err(());
+    }
+    let value = query.strip_prefix("download_selection=").ok_or(())?;
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        || header.as_deref().is_some_and(|h| h != value)
+    {
+        return Err(());
+    }
+    Ok(Some(value.to_owned()))
 }
 // The owned read lease survives handler completion and is dropped only when the
 // response body is consumed/dropped. A slow streaming client prevents switching.

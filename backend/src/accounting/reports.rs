@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 
 use super::accounts::{AccountId, AccountingElement};
-use super::journal::{JournalDate, JournalEntryId, JournalLineId, JournalSide};
+use super::journal::{JournalDate, JournalEntryId, JournalLineId, JournalSide, JournalTime};
 use super::money::{MinorUnits, MoneyError};
 
 /// One account's activity and net position in an as-of trial balance.
@@ -54,6 +54,7 @@ pub struct GeneralLedgerLine {
     pub entry_id: JournalEntryId,
     pub line_id: JournalLineId,
     pub entry_date: JournalDate,
+    pub entry_time: Option<JournalTime>,
     pub line_no: i64,
     pub side: JournalSide,
     pub amount: MinorUnits,
@@ -113,6 +114,7 @@ pub struct GeneralJournalLine {
 pub struct GeneralJournalEntry {
     pub id: JournalEntryId,
     pub entry_date: JournalDate,
+    pub entry_time: Option<JournalTime>,
     pub posted_at: String,
     pub lines: Vec<GeneralJournalLine>,
     pub debit_total: MinorUnits,
@@ -385,6 +387,7 @@ impl ReportRepository {
             SELECT entry.id AS entry_id,
                    line.id AS line_id,
                    entry.entry_date,
+                   entry.entry_time,
                    line.line_no,
                    line.side,
                    line.amount_minor,
@@ -426,6 +429,7 @@ impl ReportRepository {
                 entry_id: JournalEntryId::new(stored.entry_id),
                 line_id: JournalLineId::new(stored.line_id),
                 entry_date,
+                entry_time: parse_stored_time(stored.entry_time.as_deref())?,
                 line_no: stored.line_no,
                 side,
                 amount,
@@ -477,6 +481,7 @@ impl ReportRepository {
             SELECT entry.id AS entry_id,
                    line.id AS line_id,
                    entry.entry_date,
+                   entry.entry_time,
                    line.line_no,
                    line.side,
                    line.amount_minor,
@@ -535,6 +540,7 @@ impl ReportRepository {
                 entry_id: JournalEntryId::new(stored.entry_id),
                 line_id: JournalLineId::new(stored.line_id),
                 entry_date,
+                entry_time: parse_stored_time(stored.entry_time.as_deref())?,
                 line_no: stored.line_no,
                 side,
                 amount,
@@ -578,6 +584,7 @@ impl ReportRepository {
             r#"
             SELECT entry.id AS entry_id,
                    entry.entry_date,
+                   entry.entry_time,
                    entry.posted_at,
                    entry.reference,
                    entry.explanation,
@@ -623,6 +630,7 @@ impl ReportRepository {
                 current = Some(GeneralJournalAccumulator {
                     id: JournalEntryId::new(stored.entry_id),
                     entry_date,
+                    entry_time: parse_stored_time(stored.entry_time.as_deref())?,
                     posted_at: stored.posted_at.clone(),
                     reference: stored.reference.clone(),
                     explanation: stored.explanation.clone(),
@@ -703,6 +711,7 @@ impl ReportRepository {
                    account.name AS account_name,
                    account.element,
                    entry.entry_date,
+                   entry.entry_time,
                    line.id AS line_id,
                    line.side,
                    line.amount_minor
@@ -819,6 +828,7 @@ async fn load_trial_balance_lines(
                    account.name AS account_name,
                    account.element,
                    entry.entry_date,
+                   entry.entry_time,
                    line.id AS line_id,
                    line.side,
                    line.amount_minor
@@ -921,6 +931,7 @@ struct LedgerLineRow {
     entry_id: i64,
     line_id: i64,
     entry_date: String,
+    entry_time: Option<String>,
     line_no: i64,
     side: String,
     amount_minor: i64,
@@ -933,6 +944,7 @@ struct LedgerLineRow {
 struct GeneralJournalLineRow {
     entry_id: i64,
     entry_date: String,
+    entry_time: Option<String>,
     posted_at: String,
     line_id: i64,
     line_no: i64,
@@ -955,6 +967,7 @@ struct TrialBalanceAccumulator {
 struct GeneralJournalAccumulator {
     id: JournalEntryId,
     entry_date: JournalDate,
+    entry_time: Option<JournalTime>,
     posted_at: String,
     lines: Vec<GeneralJournalLine>,
     debit_total: MinorUnits,
@@ -1022,6 +1035,7 @@ fn finish_general_journal_entry(
     Ok(GeneralJournalEntry {
         id: entry.id,
         entry_date: entry.entry_date,
+        entry_time: entry.entry_time,
         posted_at: entry.posted_at,
         reference: entry.reference,
         explanation: entry.explanation,
@@ -1067,6 +1081,13 @@ fn minor_units_from_report_total(total: i128) -> Result<MinorUnits, ReportError>
     i64::try_from(total)
         .map(MinorUnits::new)
         .map_err(|_| ReportError::TotalOverflow)
+}
+
+fn parse_stored_time(value: Option<&str>) -> Result<Option<JournalTime>, ReportError> {
+    value
+        .map(JournalTime::parse)
+        .transpose()
+        .map_err(|error| ReportError::InvalidStoredJournal(error.to_string()))
 }
 
 #[cfg(test)]

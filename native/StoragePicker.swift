@@ -25,14 +25,30 @@ func nonSymlinkCanonicalPath(_ path: String) -> String? {
     }
     return canonical == expected ? canonical : nil
 }
-let input = FileHandle.standardInput.readData(ofLength: 1025)
-guard input.count <= 1024,
+func validatedInitialDirectoryPath(_ path: String, kind: String) -> String? {
+    guard kind == "book_destination", path.hasPrefix("/"), path.utf8.count <= 4096,
+          !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+          let canonical = posixCanonicalPath(path), canonical == path else { return nil }
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+    return canonical
+}
+let input = FileHandle.standardInput.readData(ofLength: 16385)
+guard input.count <= 16384,
       let document = try? JSONSerialization.jsonObject(with: input) as? [String: Any],
-      Set(document.keys) == Set(["format", "nonce", "kind"]),
+      Set(document.keys) == Set(["format", "nonce", "kind"]) || Set(document.keys) == Set(["format", "nonce", "kind", "initial_directory"]),
       document["format"] as? String == format,
       let nonce = document["nonce"] as? String, nonce.count == 64,
       nonce.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
       let kind = document["kind"] as? String, kinds.contains(kind) else { stop() }
+// This optional path comes only from trusted process startup configuration,
+// never browser JSON. Refuse aliases, traversal, controls and non-directories.
+var initialDirectory: URL?
+if let supplied = document["initial_directory"] {
+    guard let path = supplied as? String,
+          let canonical = validatedInitialDirectoryPath(path, kind: kind) else { stop() }
+    initialDirectory = URL(fileURLWithPath: canonical, isDirectory: true)
+}
 
 let application = NSApplication.shared
 application.setActivationPolicy(.regular)
@@ -70,6 +86,7 @@ if destinations.contains(kind) {
     panel.title = "kAccounting-Extra-01"
     panel.canCreateDirectories = false
     panel.isExtensionHidden = false
+    if let directory = initialDirectory { panel.directoryURL = directory }
     switch kind {
     case "request_destination":
         panel.message = "Choose a new recipient request file."

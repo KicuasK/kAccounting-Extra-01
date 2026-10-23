@@ -2,6 +2,18 @@
 
 Status: fully approved by the user on 2026-10-22.
 
+## Latest amendments — 2026-10-23 (Taipei)
+
+In the current takeover chat, the user replied 「科目代碼，可以刪除」 and
+selected 「先保留借／貸方向」. Remove visible account codes; no allocation,
+reuse or code migration is needed. Internal AccountId remains unchanged. This
+supersedes the four-digit revision recorded below. Display balances with explicit
+debit/credit direction for now, `0` for verified zero and `—` for unavailable
+balances. A signed convention and credit-card capacity remain unapproved.
+
+The user explicitly requested UI and remaining non-UI development together;
+older UI-last gates no longer block UI work. Existing journal approval stands.
+
 This is the approved decision record for the remaining Version 01 work. Any
 future change requires an explicit user decision and must be recorded here
 before affected implementation changes.
@@ -240,3 +252,21 @@ policy only; all other accounting, draft and sibling-order decisions remain.
 See [the authoritative UI handoff](UI_DESIGN_HANDOFF_2026-10-22.md) for original
 mockups, latest-request precedence and pending policies. Signed-balance semantics
 and credit-card capacity presentation are not approved by this visual revision.
+
+## Payment reminders and AR/AP — approved 2026-10-23
+
+The user authorized development in this order: future-payment reminders, then
+AR/AP, using Super as a reference while preserving Extra-01 invariants.
+
+- Reminders remain planning records without changing ledger balances. Actual
+  payment first creates a journal draft; only successful posting links a payment
+  record. No automatic posting or manual claim of paid status replaces evidence.
+- AR/AP explicitly selects already-posted lines to establish item tracking.
+  Existing history may be classified manually; not every transaction in an
+  account must immediately be tracked. Unclassified amounts must remain visible.
+- Before reversing a source with active receipt/payment allocations, the user
+  must explicitly release those allocations. Original payment journals remain
+  immutable and retained; release changes tracking, not ledger balances.
+- All new writes retain exact integer amounts, atomic validation, selected-book
+  guards and append-only audit history. No Super naming convention, account
+  seeding, mutable posted-entry workflow or credit-card policy is inherited.

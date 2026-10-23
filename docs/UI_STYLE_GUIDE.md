@@ -24,6 +24,7 @@ Status: implementation guide with later user-approved visual revisions; see
 The user supplied a traditional General Journal reference and prefers its entry structure. The design direction is:
 
 - Group entries by date.
+- Reference reaffirmed 2026-10-23: omit the PR column; credit accounts are indented and the narrative follows account lines. The approved optional entry reference remains separate.
 - Place account titles and the narrative in the main column.
 - Keep debit and credit in fixed, separate, right-aligned columns.
 - Show debit accounts flush left and indent credit accounts.

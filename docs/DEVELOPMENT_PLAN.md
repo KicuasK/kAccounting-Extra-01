@@ -1,5 +1,167 @@
 # Development Plan
 
+最新非 UI 增量：[私人代理版本升級與回復工具](PRIVATE_TRANSPORT_VERSIONING_2026-10-23.md)；只完成隔離驗證，未套用真實管理員安裝，試用服務保留。
+
+最新非 UI 工具：[安裝、啟停、更新與復原](PRIVATE_RUNTIME_OPERATIONS_2026-10-23.md) 已完成隔離測試；未套用系統安裝，含 root 工作控制與選填登入啟動設定，但實際安裝、私人連線及登入／重開機驗收仍待完成。試用服務保留。
+
+本輪非 UI 工具與驗證結果：[單主機非 UI 增量](SINGLE_HOST_NON_UI_2026-10-23.md)。
+
+## Current deployment scope — 2026-10-23 (supersedes older gates)
+
+The user selected **one Mac host with private remote-browser access**. The Mac
+keeps the books and runs the backend; remote devices use authenticated private
+HTTPS. Public exposure and Tailscale Funnel remain forbidden. Developer ID
+signing and notarization are **out of scope**, rather than paused prerequisites.
+Physical cross-Mac qualification is optional recovery/future work, not a gate for
+this single-host deployment; encrypted backup and restore remain required.
+
+Do not change UI code or run frontend/UI builds in this round. Candidate6 is the
+latest verified development runtime, including the no-PR journal layout; reuse
+its existing assets and external receipt
+`deliverables/candidate6-verification/DELIVERY.json`. The user's candidate6-asset,
+fake-data trial page is currently running: preserve its process and port, and do
+not replace it with a deployment or stop it as test cleanup. It is not the
+permanent service or real-Keychain acceptance.
+
+Next, shortest independent non-UI work first:
+
+1. Verify existing deployment-plan/package integrity and tool refusal cases with
+   disposable data; retain the current package and lockfiles.
+2. Complete reviewable installation/start/stop/update/recovery tooling and
+   operator instructions, preserving existing binaries, data and unknown files.
+   Preparation is not installation; test offline before any persistent action.
+3. Run backend/tool verification and locked Release only; record the actual
+   results separately from historical full-stack counts below.
+4. Arrange private-proxy identity/configuration, real Keychain, persistent startup,
+   logout/login and reboot acceptance only when the required operator action is
+   concrete. Explain that action then; no permanent proxy or login service is
+   claimed installed or qualified by these preparatory checks.
+
+Older UI/cross-Mac/signing gates and time estimates below are retained history;
+this scope takes precedence. The remaining operational checks are still open.
+
+## Current increment — 2026-10-23 (draft attachment and directory-package Safari acceptance)
+
+Disposable Safari checks passed for draft attachment cancellation, pending-file
+save protection, explicit upload confirmation, integrity verification, reference
+removal and unsaved-edit protection. Directory-package import passed genuine
+native selections and explicit confirmation without switching the current book.
+Explicit reopening verified exact 9,007,199,254,740,993 posted totals and attachment
+integrity; independent receipt checks confirmed source/package/request preservation,
+fresh local encryption and complete posted-entry equality. See
+[acceptance evidence](DRAFT_FOLDER_SAFARI_2026-10-23.md).
+Actual complete verification: **684 Rust passed, 9 intentionally ignored;
+141 Python and 185 frontend passed; zero failures**.
+Only acceptance fixtures and documentation changed; production code, frontend
+and lockfiles did not. Retain the verified candidate5 development package.
+This increment's source and evidence belong to external
+`deliverables/draft-folder-verification/DELIVERY.json`.
+Formal signing remains paused. Permanent private deployment, real Keychain/
+login/reboot and physical cross-Mac qualification remain open. Same-Mac fake-key
+acceptance does not qualify those operations. Older pending draft-attachment and
+directory-import statements below are superseded; remaining large-Safari-file
+and stale-tab transfer variants still need their own acceptance.
+
+## Previous increment — 2026-10-23 (partial payments, AR/AP splits and filters, retained history)
+
+Explicit partial-payment amounts and full-source-line multi-item AR/AP splits
+are implemented, with exact BigInt validation, type/status/keyword filters and
+filter-scoped summaries. Payment creation remains a draft; separate successful
+posting creates the payment link. Safari verified a 1,000 TWD plan paid as
+400 + 600, AR 500 split into 300 + 200, AP 300 split into 100 + 200, filtering,
+and a 75 TWD AP payment allocation. See
+[implementation and acceptance](PARTIAL_SPLIT_UI_2026-10-23.md).
+Actual complete verification: **684 Rust passed, 9 intentionally ignored;
+141 Python and 185 frontend passed; locked Release succeeded**.
+The new development package is candidate5; its exact source binding, hash and
+logs belong to external `deliverables/partial-split-verification/DELIVERY.json`.
+No new migration is introduced; preserve protected migration 8–10 handling.
+Formal signing remains paused. Permanent private deployment, real Keychain/
+login/reboot and physical cross-Mac qualification remain open. Credit-card,
+TPASS, ageing reports and background notifications remain future work.
+Older checkpoints below are retained history.
+
+## Previous increment — 2026-10-23 (payment memos and AR/AP, retained history)
+
+Payment plans, explicit payment-draft creation and separate posting, plus
+append-only AR/AP source splits, partial payment/adjustment allocations and
+reason-required unallocation are implemented. Reversals with active allocations
+are blocked. See [implementation and evidence](PAYMENT_ARAP_2026-10-23.md).
+Actual complete verification: **684 Rust passed, 9 intentionally ignored;
+141 Python and 171 frontend passed; locked Release succeeded**.
+The development package is candidate4; its exact source binding, hash and logs
+belong to external `deliverables/payment-arap-verification/DELIVERY.json`.
+
+Migrations 8–10 require the existing runtime's protected migration and migration
+backup workflow. Preserve that workflow for existing books; do not hand-edit the
+schema, skip the backup or remove migration records to simulate a downgrade.
+An older binary must not read a book upgraded to the new schema.
+Formal signing remains paused. Private deployment, real Keychain/login/reboot
+and physical cross-Mac qualification remain separate acceptance work.
+
+## Previous checkpoint — 2026-10-23 (UI4, retained history)
+
+Source checkpoint `35d6d0f35aea2962f1322967959d559cf09d1294` completes explicit
+backup-identity setup after legacy restore and authenticated import/export
+recovery UI acceptance. Safari reopened the restored book and verified its
+exact large-integer account balances before separately confirming setup and backup.
+Protected source and unknown files survived recovery. Complete verification:
+**669 Rust passed, 9 intentionally ignored; 141 Python and 141 frontend passed;
+locked Release succeeded**. An additional Release 128 MiB SIGKILL recovery test
+passed separately. See [UI4 evidence](BACKUP_IDENTITY_RECOVERY_2026-10-23.md).
+The verified development package is candidate3; exact source binding, manifest
+hash and logs are in external `deliverables/ui4-verification/DELIVERY.json`.
+These results replace the older UI3 counts and pending recovery/restored-report
+statements below; they are not added to historical test totals.
+
+Next work, shortest independent checks first:
+
+1. Close remaining disposable Safari acceptance gaps: native cancellation,
+   directory-package import and representative large-attachment workflows.
+   Preserve failed/unknown work and independently verify protected contents.
+2. Keep development packaging, update/recovery instructions and disabled private
+   deployment plans reviewable; rerun verification after changes.
+3. Permanent private-proxy installation and real Keychain/login/reboot
+   qualification require the appropriate operator authorization or Mac action.
+   Physical cross-Mac acceptance needs another Mac. These remain unverified.
+
+Formal signing is paused by the user; retain development packaging. Physical
+APFS/exFAT media acceptance and touch-friendly iPad UI remain Version 02.
+Account codes are removed, balances retain debit/credit direction, and unresolved
+credit-card policies must not be guessed. Version 01 is not yet fully accepted.
+
+## Historical checkpoints and original schedule
+
+The remainder records earlier checkpoints and the original forecast. Its
+UI-last gates, unbuilt-UI descriptions and original day estimates are historical,
+not the current remaining-work list or a new delivery estimate.
+
+Latest increment (2026-10-23): account maintenance, draft/posting/correction/reversal,
+five reports, attachment management and eight storage workspaces are implemented.
+Typed localhost native selection, first-book creation, generation-guarded native
+downloads, original File-body streaming, full helper-app packaging and offline
+deployment review verification are integrated. User-requested UI/non-UI parallel
+work supersedes the historical UI-last gates below. Visible account codes remain
+removed and balances retain explicit debit/credit direction.
+
+Complete verification after the trusted native initial-directory improvement:
+664 Rust passed/9 intentionally ignored, 141 Python and 132 frontend passed,
+locked Release succeeded. Safari disposable backup, posted 62-byte attachment
+upload/verify/download and native first-book creation without automatic selection
+passed. A same-Mac fake-key request/export/download/single-file import/reopen chain
+also passed with exact large-integer balances; physical cross-Mac, large attachments,
+folder import and recovery live flows remain pending. Restore to a new destination
+also passed without selection changes; opening restored-book reports remains
+unverified. Signing, permanent
+private deployment and real Keychain/login/reboot qualification remain open.
+See [current implementation and evidence](BUILD_STORAGE_UI_2026-10-23.md).
+Native-helper packages now require `serve-native-chooser` with the exact helper
+argument; verification explicitly reports `legacy_native_startup` for old bundles.
+Final package hashes and source binding live in external
+`deliverables/ui3-verification/DELIVERY.json` to avoid self-referential manifests.
+All older baseline/pending statements below are historical and do not mean the
+implemented journal, report, attachment or storage UI is still unbuilt.
+
 Status: active Version 01 completion plan, based on clean Git baseline
 `78d2924`.
 
